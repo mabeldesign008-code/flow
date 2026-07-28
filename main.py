@@ -15,6 +15,7 @@ import traceback
 import winsound
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import tkinter as tk
 from tkinter import Label, messagebox, scrolledtext
@@ -26,9 +27,13 @@ from pynput import keyboard
 from pynput.keyboard import Controller as KeyboardController
 
 from audio import AudioCapture, process as process_audio
+from context import AppContextReader, DictionaryLearner, ProfileSet
 from injector import TextInjector
 from refine import Refiner, basic_cleanup
-from stt import AssemblyAIClient, UserDictionary, default_config_dir
+from stt import (
+    AssemblyAIClient, StreamingSession, UserDictionary,
+    default_config_dir, websockets_available,
+)
 from ui import theme
 from ui.overlay import FloatingPill, PillState
 
@@ -53,6 +58,13 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
 )
 logger = logging.getLogger("whisprflow")
+
+
+def _flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def beep_async(freq: int, ms: int) -> None:
@@ -84,6 +96,25 @@ class WhisprFlowApp:
         # pre-roll ring already holds the moment before the hotkey fired.
         self.capture = AudioCapture()
 
+        # Context: what app the user is in, how text should be formatted
+        # there, and which words keep coming up.
+        self.app_context = AppContextReader(
+            enabled=_flag("WHISPRFLOW_CONTEXT", True),
+            read_surrounding=_flag("WHISPRFLOW_READ_FIELD", False),
+        )
+        self.profiles = ProfileSet(CONFIG_DIR / "profiles.json")
+        self.profiles.write_template()
+        self.learner = DictionaryLearner(
+            CONFIG_DIR / "learned.json", self.dictionary,
+            enabled=_flag("WHISPRFLOW_AUTOLEARN", True),
+        )
+
+        # Streaming gives partial text while the user is still talking and
+        # cuts the post-speech wait from ~2s to ~0.5s.
+        self.streaming_enabled = _flag("WHISPRFLOW_STREAMING", True) and websockets_available()
+        self._session: Optional[StreamingSession] = None
+        self._live_context = None
+
         self._state_lock = threading.RLock()
         self.is_recording = False
         self.generation = 0          # bumped on cancel to invalidate in-flight work
@@ -92,6 +123,7 @@ class WhisprFlowApp:
         self.last_text_injected = ""
         self.last_failed = False
         self._start_time = 0.0
+        self._partial = ""
 
         self.loop = asyncio.new_event_loop()
 
@@ -188,6 +220,29 @@ class WhisprFlowApp:
         self._button(row, "Add", self.add_dictionary_term).pack(side="left", padx=(0, 6))
         self._button(row, "Open file", self.open_dictionary,
                      subtle=True).pack(side="left")
+
+        # Auto-learn suggestions. Surfaced for approval rather than added
+        # silently -- a dictionary that fills itself with garbage is worse
+        # than an empty one.
+        self.suggest_frame = tk.Frame(card3, bg=theme.HEX_BG_CARD)
+        self.suggest_frame.pack(fill="x", pady=(10, 0))
+
+        # ── Context ──
+        card5 = self._card(wrap, "Context")
+        ci = self.app_context.get_info()
+        ctx_ok = ci["win32"] and ci["enabled"]
+        Label(card5,
+              text=("Reading foreground app" if ctx_ok else "Unavailable"),
+              font=(theme.UI_FONT, 10),
+              fg=theme.HEX_TEXT if ctx_ok else theme.HEX_MUTED,
+              bg=theme.HEX_BG_CARD).pack(anchor="w")
+        detail = f"{len(self.profiles.profiles)} formatting profiles"
+        if self.streaming_enabled:
+            detail += " \u00b7 streaming on"
+        Label(card5, text=detail, font=(theme.UI_FONT, 9),
+              fg=theme.HEX_MUTED, bg=theme.HEX_BG_CARD).pack(anchor="w", pady=(1, 8))
+        self._button(card5, "Edit profiles", self.open_profiles,
+                     subtle=True).pack(anchor="w")
 
         # ── Activity ──
         card4 = self._card(wrap, "Activity", expand=True)
@@ -299,6 +354,51 @@ class WhisprFlowApp:
         else:
             self.log(f"\u201c{term}\u201d not added (duplicate or too long).", "warn")
 
+    def _render_suggestions(self):
+        for child in self.suggest_frame.winfo_children():
+            child.destroy()
+
+        candidates = self.learner.candidates(limit=3)
+        if not candidates:
+            return
+
+        Label(self.suggest_frame, text="SUGGESTED", font=(theme.UI_FONT, 8, "bold"),
+              fg=theme.HEX_FAINT, bg=theme.HEX_BG_CARD).pack(anchor="w", pady=(0, 4))
+
+        for c in candidates:
+            row = tk.Frame(self.suggest_frame, bg=theme.HEX_BG_CARD)
+            row.pack(fill="x", pady=1)
+            Label(row, text=c.term, font=(theme.UI_FONT, 10),
+                  fg=theme.HEX_TEXT, bg=theme.HEX_BG_CARD).pack(side="left")
+            Label(row, text=f"heard {c.count}\u00d7", font=(theme.UI_FONT, 8),
+                  fg=theme.HEX_FAINT, bg=theme.HEX_BG_CARD).pack(side="left", padx=(6, 0))
+            tk.Button(row, text="\u2715", command=lambda t=c.term: self.dismiss_term(t),
+                      bg=theme.HEX_BG_CARD, fg=theme.HEX_FAINT, relief="flat",
+                      font=(theme.UI_FONT, 9), cursor="hand2", borderwidth=0,
+                      activebackground=theme.HEX_BG_CARD,
+                      highlightthickness=0).pack(side="right")
+            tk.Button(row, text="Add", command=lambda t=c.term: self.accept_term(t),
+                      bg=theme.HEX_BG_INPUT, fg=theme.HEX_TEXT, relief="flat",
+                      font=(theme.UI_FONT, 8, "bold"), padx=8, pady=2,
+                      cursor="hand2", borderwidth=0,
+                      activebackground=theme.HEX_BG_HOVER,
+                      highlightthickness=0).pack(side="right", padx=(0, 6))
+
+    def accept_term(self, term: str):
+        if self.learner.accept(term):
+            self.log(f"Learned \u201c{term}\u201d.", "ok")
+        self._refresh_status()
+
+    def dismiss_term(self, term: str):
+        self.learner.dismiss(term)
+        self._refresh_status()
+
+    def open_profiles(self):
+        try:
+            os.startfile(str(self.profiles.path))
+        except Exception as e:
+            self.log(f"Could not open profiles: {e}", "error")
+
     def open_dictionary(self):
         try:
             os.startfile(str(self.dictionary.path))
@@ -331,6 +431,10 @@ class WhisprFlowApp:
                 txt, col = f"{st['model']} · guarded", theme.HEX_SUCCESS
         self.refine_status.config(text=txt, fg=col)
         self.dict_label.config(text=f"{len(self.dictionary)} terms")
+        try:
+            self._render_suggestions()
+        except Exception:
+            pass
 
     # ══════════════════════════════════════════════════════════════════
     #  Logging
@@ -370,9 +474,55 @@ class WhisprFlowApp:
             self.generation += 1
 
         self._start_time = time.monotonic()
+        self._partial = ""
         self.capture.begin()
         beep_async(880, 60)
         self.pill.set_state(PillState.RECORDING)
+
+        # Read the foreground app now, while the user speaks -- never
+        # after, where it would sit on the critical path. Costs ~2-10 ms
+        # via UI Automation, versus 0.3-2 s for the OCR this replaced.
+        threading.Thread(target=self._grab_context, daemon=True).start()
+
+        if self.streaming_enabled and self.stt.is_configured:
+            asyncio.run_coroutine_threadsafe(self._open_stream(gen), self.loop)
+
+    def _grab_context(self):
+        try:
+            self._live_context = self.app_context.capture()
+        except Exception:
+            self._live_context = None
+
+    async def _open_stream(self, gen: int):
+        """Open a streaming socket and pump the mic into it while the user
+        talks. Audio is still buffered locally, so a socket failure costs
+        nothing but the partials."""
+        session = StreamingSession(
+            self.stt.api_key,
+            keyterms=self.dictionary.as_keyterms(),
+            on_partial=self._on_partial,
+        )
+        if not await session.open():
+            logger.debug("streaming unavailable: %s", session.error)
+            return
+        if self._stale(gen):
+            await session.abort()
+            return
+
+        self._session = session
+        sent = 0
+        while not self._stale(gen) and self.is_recording:
+            chunk = self.capture.tail_since(sent)
+            if chunk is not None and len(chunk):
+                session.feed(chunk)
+                sent += len(chunk)
+            await asyncio.sleep(0.08)
+
+    def _on_partial(self, text: str):
+        if not text or not self.is_recording:
+            return
+        self._partial = text
+        self.pill.set_partial(text)
 
     def stop_recording(self):
         with self._state_lock:
@@ -391,7 +541,8 @@ class WhisprFlowApp:
             return
 
         self.pill.set_state(PillState.PROCESSING)
-        asyncio.run_coroutine_threadsafe(self._pipeline(audio, gen), self.loop)
+        session, self._session = self._session, None
+        asyncio.run_coroutine_threadsafe(self._pipeline(audio, gen, session), self.loop)
 
     def cancel_recording(self):
         with self._state_lock:
@@ -401,6 +552,9 @@ class WhisprFlowApp:
             self.generation += 1     # invalidates any in-flight pipeline
 
         self.capture.discard()
+        session, self._session = self._session, None
+        if session is not None:
+            asyncio.run_coroutine_threadsafe(session.abort(), self.loop)
         beep_async(440, 90)
         self.pill.set_state(PillState.IDLE)
         self.log("Cancelled.", "dim")
@@ -414,24 +568,18 @@ class WhisprFlowApp:
     #  Pipeline
     # ══════════════════════════════════════════════════════════════════
 
-    async def _pipeline(self, audio, gen: int):
+    async def _pipeline(self, audio, gen: int, session=None):
         try:
             cleaned = await asyncio.to_thread(process_audio, audio, self.capture.sample_rate)
             if self._stale(gen):
-                return
-
-            if not cleaned.speech_detected:
-                self.log("No speech detected.", "warn")
-                self.pill.set_state(PillState.IDLE)
+                if session:
+                    await session.abort()
                 return
 
             self.last_audio = (cleaned.samples, cleaned.sample_rate)
 
-            result = await self.stt.transcribe(
-                cleaned.samples, cleaned.sample_rate,
-                keyterms=self.dictionary.as_keyterms(),
-            )
-            if self._stale(gen):
+            result = await self._transcribe(cleaned, session, gen)
+            if self._stale(gen) or result is None:
                 return
 
             if not result.ok:
@@ -444,12 +592,16 @@ class WhisprFlowApp:
             self.last_raw_text = raw
 
             if not raw.strip():
-                self.log("No speech detected.", "warn")
+                if not cleaned.speech_detected:
+                    self.log("No speech detected.", "warn")
+                else:
+                    self.log("Nothing transcribed.", "warn")
                 self.pill.set_state(PillState.IDLE)
                 return
 
             if DEBUG:
-                self.log(f"[raw {result.latency_ms}ms conf={result.confidence:.2f}] {raw}")
+                self.log(f"[{result.model} {result.latency_ms}ms "
+                         f"conf={result.confidence:.2f}] {raw}")
 
             final = await self._refine(raw, result)
             if self._stale(gen):
@@ -462,6 +614,11 @@ class WhisprFlowApp:
             self.log(_preview(final), "ok")
             self.pill.flash_success(_preview(final, 22))
 
+            # Learn from what was said, once the text is safely delivered.
+            self.learner.observe(
+                raw, [w.text for w in result.low_confidence_words()])
+            self.root.after(0, self._refresh_status)
+
         except Exception as e:
             self.last_failed = True
             self.log(f"Failed: {e}", "error")
@@ -469,15 +626,50 @@ class WhisprFlowApp:
             if DEBUG:
                 traceback.print_exc()
 
+    async def _transcribe(self, cleaned, session, gen):
+        """Prefer the streaming result -- the audio is already uploaded, so
+        it returns in ~0.5s instead of ~2s. Fall back to batch if the socket
+        failed or produced nothing. Both paths hit the same model, so this
+        is not a silent downgrade."""
+        if session is not None:
+            try:
+                streamed = await session.close_and_finalise()
+                if streamed.ok and streamed.text.strip():
+                    return streamed
+                logger.debug("stream empty (%s); using batch", streamed.error)
+            except Exception as e:
+                logger.debug("stream finalise failed: %s", e)
+
+        if self._stale(gen):
+            return None
+
+        if not cleaned.speech_detected and not self._partial:
+            self.log("No speech detected.", "warn")
+            self.pill.set_state(PillState.IDLE)
+            return None
+
+        return await self.stt.transcribe(
+            cleaned.samples, cleaned.sample_rate,
+            keyterms=self.dictionary.as_keyterms(),
+        )
+
     async def _refine(self, raw: str, result) -> str:
         if not (self.refinement_enabled.get() and self.refiner.is_configured):
             return basic_cleanup(raw)
+
+        ctx = self._live_context
+        profile = self.profiles.resolve(ctx.process if ctx else "")
 
         final = await self.refiner.refine(
             raw,
             uncertain_words=[w.text for w in result.low_confidence_words()],
             dictionary_terms=self.dictionary.as_keyterms(),
+            app_context=ctx.as_prompt() if ctx else "",
+            profile_instruction=profile.instruction,
+            allow_restructure=profile.allow_restructure,
         )
+        if DEBUG and profile.name != "Default":
+            self.log(f"[profile: {profile.name}]")
         if self.refiner.last_rejected:
             self.log(f"Refinement rejected ({self.refiner.last_rejected}) — kept raw text.",
                      "warn")

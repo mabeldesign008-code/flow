@@ -28,7 +28,8 @@ Hold **Ctrl + Win**, speak, release. Text is injected at the cursor.
 ## How it works
 
 ```
-always-on mic (500 ms pre-roll) → VAD → AssemblyAI → Groq → guard → paste
+always-on mic (500 ms pre-roll) → VAD → AssemblyAI (streaming)
+   → Groq + per-app profile → guard → paste → auto-learn
 ```
 
 The mic is open before you press the key, so the first syllable is never
@@ -41,8 +42,10 @@ drops a dictionary term — the raw transcript is used instead. See
 | Stage | Component |
 |---|---|
 | Capture | Always-on 16 kHz stream + pre-roll ring (`audio/`) |
-| Transcription | **AssemblyAI Universal-3.5 Pro** + keyterms |
-| Dictionary | `%APPDATA%\WhisprFlow\user_dictionary.txt` |
+| Transcription | **AssemblyAI** — streaming partials, ~0.5 s tail |
+| Context | Foreground app via UI Automation (~5 ms) |
+| Profiles | Per-app formatting: code, terminal, chat, email, docs |
+| Dictionary | `%APPDATA%\WhisprFlow\user_dictionary.txt`, auto-learning |
 | Refinement | Groq `llama-3.1-8b-instant`, output verified by a guard |
 | Injection | Direct unicode ≤120 chars, else clipboard w/ restore |
 
@@ -58,6 +61,11 @@ Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 ASSEMBLYAI_API_KEY=...      # required for cloud accuracy
 GROQ_API_KEY=...            # optional, for LLM refinement
 ASSEMBLYAI_MODEL=universal-3-5-pro
+
+WHISPRFLOW_STREAMING=1      # live partials (default on)
+WHISPRFLOW_CONTEXT=1        # read foreground app (default on)
+WHISPRFLOW_READ_FIELD=0     # read focused field's text (default OFF)
+WHISPRFLOW_AUTOLEARN=1      # suggest dictionary terms (default on)
 ```
 
 Keys can also be set in the UI (system tray → Transcription History).
@@ -83,7 +91,7 @@ early, or the pill itself after an error to retry.
 ## Development
 
 ```bash
-python -m pytest -q                    # 81 tests
+python -m pytest -q                    # 133 tests
 python eval/mock_api_test.py           # end-to-end HTTP flow
 python eval/run_wer.py                 # accuracy on your own clips
 ```
@@ -98,10 +106,15 @@ audio/
 ui/
   overlay.py              floating pill
   theme.py                design tokens
+context/
+  app_context.py          foreground app via UI Automation
+  profiles.py             per-app formatting rules
+  learner.py              auto-learn dictionary terms
 injector.py               text insertion
 stt/
   base.py                 TranscriptionResult + WAV encoding
   assemblyai_client.py    transcription engine
+  streaming.py            live partials over WebSocket
   dictionary.py           user dictionary
 refine/
   refiner.py              Groq LLM cleanup

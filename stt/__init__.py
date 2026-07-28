@@ -3,6 +3,7 @@
 from .base import TranscriptionResult, WordInfo, float_to_wav_bytes
 from .assemblyai_client import AssemblyAIClient, clean_keyterms
 from .dictionary import UserDictionary, default_config_dir
+from .streaming import StreamingSession, websockets_available
 
 __all__ = [
     "TranscriptionResult",
@@ -12,4 +13,6 @@ __all__ = [
     "clean_keyterms",
     "UserDictionary",
     "default_config_dir",
+    "StreamingSession",
+    "websockets_available",
 ]

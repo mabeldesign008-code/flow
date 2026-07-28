@@ -225,6 +225,21 @@ class AudioCapture:
         audio = np.concatenate(blocks)
         return audio if len(audio) else None
 
+    def tail_since(self, offset: int) -> Optional[np.ndarray]:
+        """Return recorded samples past `offset`, for live streaming.
+
+        Lets the streaming uploader drain the take while it is still being
+        recorded, without disturbing the buffer the batch path will use.
+        """
+        with self._lock:
+            if not self._blocks:
+                return None
+            total = sum(len(b) for b in self._blocks)
+            if offset >= total:
+                return None
+            audio = np.concatenate(self._blocks) if len(self._blocks) > 1 else self._blocks[0]
+            return audio[offset:].copy()
+
     def discard(self) -> None:
         """Abandon the take without returning anything."""
         with self._lock:

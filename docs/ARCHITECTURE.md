@@ -3,17 +3,25 @@
 ## Pipeline
 
 ```
+                    ┌── app context (UIA)  ~5 ms, in parallel
+                    │   process, window title, control type
+                    ▼
 always-on 16 kHz stream ──► 500 ms pre-roll ring
+                              │
+                              ├──► streaming socket (live partials)
+                              │
                               │
         hotkey (Ctrl+Win) ────┤  mic is ALREADY live
                               ▼
                      energy VAD + RMS levelling      ~3 ms
                               ▼
-                     AssemblyAI universal-3-5-pro    ~1-2 s
+                     AssemblyAI                      ~0.5 s tail
+                     streaming, else batch (~2 s)
                      + keyterms (user dictionary)
                               ▼
                      Groq llama-3.1-8b-instant       ~200 ms
                      + low-confidence words
+                     + per-app profile instruction
                               ▼
                      ┌─────  GUARD  ─────┐
                      │ negation flipped? │──► reject, use raw
@@ -25,6 +33,8 @@ always-on 16 kHz stream ──► 500 ms pre-roll ring
                   wait for modifier release
                                ▼
                      inject at cursor
+                               ▼
+                     auto-learn repeated terms
 ```
 
 No fallback engines anywhere. A silent downgrade to a weaker model is worse
@@ -40,6 +50,10 @@ ship it.
 | `audio/process.py` | VAD, high-pass, RMS levelling |
 | `stt/assemblyai_client.py` | Transcription |
 | `stt/dictionary.py` | User dictionary → keyterms |
+| `stt/streaming.py` | Live partials over WebSocket |
+| `context/app_context.py` | Foreground app via UI Automation |
+| `context/profiles.py` | Per-app formatting rules |
+| `context/learner.py` | Auto-learn dictionary terms |
 | `refine/refiner.py` | Groq cleanup |
 | `refine/guard.py` | **Hallucination rejection** |
 | `ui/overlay.py` | Floating pill |
@@ -237,3 +251,102 @@ python -m pytest -q          # 81 tests
 python eval/mock_api_test.py # HTTP flow against a fake AssemblyAI
 python eval/run_wer.py       # WER on your own clips
 ```
+
+
+---
+
+## Streaming
+
+Batch transcription makes the user finish speaking and *then* wait ~2 s
+staring at nothing. Streaming uploads audio while they talk, so the wait
+after they stop is only the tail.
+
+Measured against the live API on a 7.44 s utterance:
+
+| | Batch | Streaming |
+|---|---|---|
+| First feedback | none until done | **1.04 s** (partial text) |
+| Wait after speech ends | ~2400 ms | **505 ms** |
+
+That is a **79% cut in perceived latency** for identical compute.
+
+The overlay switches from waveform to live text as soon as words arrive —
+watching your sentence appear is far better feedback than a bouncing
+equaliser. Text is measured against the gap between the cancel and stop
+buttons and trimmed to fit, so it can never collide with them.
+
+Audio is buffered locally throughout, so if the socket fails we finalise
+from the batch endpoint and nothing is lost. This is the one fallback worth
+keeping: it is between two paths to the *same* model, not a silent
+downgrade to a weaker one.
+
+## App context
+
+The deleted `screen_context.py` screenshotted the whole desktop and ran
+PaddleOCR on it: 0.3–2 s on the critical path, low-signal text (taskbar,
+clock, unrelated windows), and your entire screen shipped to a third party
+on every dictation.
+
+`context/app_context.py` reads the same information from the OS:
+
+| Source | Cost | Yields |
+|---|---|---|
+| `GetForegroundWindow` | ~0.1 ms | process name, window title |
+| UI Automation | ~2–10 ms | focused control type, optionally its text |
+
+Captured **at hotkey-down on a worker thread**, never after speech ends.
+UIA calls are budgeted at 350 ms and disabled after three consecutive
+failures, so a hung accessibility client can never stall dictation.
+
+Reading the focused field's existing text is the most useful signal and the
+most privacy-sensitive, so it is a separate toggle, off by default
+(`WHISPRFLOW_READ_FIELD=1`).
+
+## Per-app profiles
+
+A profile matched on the process name contributes one instruction to the
+refinement prompt. Verified live:
+
+| App | Input | Output |
+|---|---|---|
+| VS Code | "a function called get user data that takes user id" | `get_user_data` … `user_id` |
+| Terminal | "git checkout dash b feature slash new login" | `git checkout -b feature/new-login` |
+| Slack | "hey can you take a look at the pr" | "hey can you take a look at the PR" |
+| Outlook | "um so i wanted to follow up on the invoice" | "I wanted to follow up on the invoice." |
+
+Profiles are **appended** to the base prompt, never substituted, so the
+meaning-preserving rules always apply. Verified: negations and amounts
+survive even under the most permissive profile (Email, `allow_restructure`).
+
+Code and Terminal set `allow_restructure=False` — literal words matter
+there, and paraphrasing them is destructive.
+
+Users extend or override via `%APPDATA%/WhisprFlow/profiles.json`. A
+malformed file is logged and ignored, never fatal.
+
+## Auto-learn
+
+Wispr Flow's real moat is that the dictionary fills itself. Theirs watches
+you type over a correction; **we deliberately do not keylog** — reading
+everything typed after a dictation would be a worse privacy trade than the
+OCR we just removed.
+
+Two safe signals instead:
+
+1. **Repetition** — an unusual token transcribed N times across sessions
+2. **Uncertainty** — a token AssemblyAI repeatedly flags low-confidence
+   (weighted double: a word the recogniser keeps struggling with is a
+   strong signal it belongs in the dictionary)
+
+A heuristic filters ordinary English: internal capitals (`WhisprFlow`),
+digits (`GPT4`), hyphens (`on-prem`), or capitalised proper nouns qualify;
+`running`, `something`, `about` do not.
+
+Candidates are **surfaced for one-click approval**, never added silently —
+a dictionary that fills itself with garbage is worse than an empty one.
+Dismissals are permanent.
+
+> A bug the tests caught: `UserDictionary` defines `__len__`, so an *empty*
+> dictionary is falsy. `if not self.dictionary` bailed out precisely when
+> the dictionary was empty, meaning the very first learned term could never
+> be added. Now `is None`.

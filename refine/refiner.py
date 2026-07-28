@@ -131,6 +131,8 @@ class Refiner:
         uncertain_words: Optional[List[str]] = None,
         dictionary_terms: Optional[List[str]] = None,
         app_context: str = "",
+        profile_instruction: str = "",
+        allow_restructure: Optional[bool] = None,
     ) -> str:
         """Return refined text, or the deterministically-cleaned original if
         refinement is unavailable or rejected by the guard."""
@@ -138,6 +140,13 @@ class Refiner:
             return text or ""
         if not self.is_configured:
             return basic_cleanup(text)
+
+        # A profile may permit restructuring (email, documents) where the
+        # default does not (code, terminals). Articulate mode still wins.
+        restructure = (
+            self.articulate_mode if allow_restructure is None
+            else (allow_restructure or self.articulate_mode)
+        )
 
         self.calls += 1
         try:
@@ -148,7 +157,7 @@ class Refiner:
                     "model": self.model,
                     "messages": [
                         {"role": "system",
-                         "content": ARTICULATE_PROMPT if self.articulate_mode else STANDARD_PROMPT},
+                         "content": self._system_prompt(profile_instruction)},
                         {"role": "user",
                          "content": self._build_input(text, uncertain_words,
                                                       dictionary_terms, app_context)},
@@ -168,7 +177,7 @@ class Refiner:
             verdict = check(
                 text, refined,
                 dictionary_terms=dictionary_terms,
-                allow_restructure=self.articulate_mode,
+                allow_restructure=restructure,
             )
             if not verdict:
                 # The rewrite looked like a hallucination. Keep the raw
@@ -184,6 +193,14 @@ class Refiner:
 
         except Exception:
             return basic_cleanup(text)
+
+    def _system_prompt(self, profile_instruction: str = "") -> str:
+        base = ARTICULATE_PROMPT if self.articulate_mode else STANDARD_PROMPT
+        if profile_instruction:
+            # Appended, never substituted: the meaning-preserving rules in
+            # the base prompt must survive whatever the profile asks for.
+            return f"{base}\n\nCONTEXT FOR THIS APP:\n{profile_instruction}"
+        return base
 
     def _build_input(
         self,

@@ -21,6 +21,16 @@ scipy>=1.11.0,<2.0.0
 # Speech recognition is AssemblyAI over plain HTTP via httpx -- no SDK
 # (the official one is synchronous and would block the asyncio loop).
 
+# ── Streaming (live partials + ~0.5s tail latency instead of ~2s) ─────
+# Optional: without it the app uses the batch endpoint and simply shows a
+# waveform instead of live text.
+websockets>=12.0,<16.0
+
+# ── App context (foreground window, focused control) ──────────────────
+# Optional: without these, refinement runs without app context.
+psutil>=5.9.0; sys_platform == "win32"
+uiautomation>=2.0.18; sys_platform == "win32"
+
 # ── GUI ───────────────────────────────────────────────────────────────
 Pillow>=10.1.0,<12.0.0
 pystray>=0.19.4,<0.20.0
