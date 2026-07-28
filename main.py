@@ -354,6 +354,10 @@ class WhisprFlowApp:
         self.client = GroqClient()
         self.sensevoice = OptimizedSenseVoiceClient(model_size="small", language="en")
         self.injector = TextInjector()
+        
+        # ── Screen context capture (OCR) ──
+        from screen_context import ScreenContext
+        self.screen_context = ScreenContext()
 
         # ── CHANGED: thread-safe recording flag ──
         self._state_lock = threading.Lock()
@@ -676,7 +680,18 @@ class WhisprFlowApp:
             if self.refinement_enabled.get():
                 self.log_message("Refining via Groq...")
                 try:
-                    final = await self.client.refine(raw, allow_fallback=True)
+                    # ── Capture screen context for context-aware refinement ──
+                    cursor_context = ""
+                    if self.screen_context.enabled:
+                        try:
+                            cursor_context = self.screen_context.get_context_for_llm(max_words=150)
+                            if cursor_context and DEBUG:
+                                self.log_message(f"[CONTEXT] {cursor_context[:100]}...")
+                        except Exception as ctx_err:
+                            if DEBUG:
+                                self.log_message(f"[CONTEXT] Error: {ctx_err}")
+                    
+                    final = await self.client.refine(raw, allow_fallback=True, cursor_context=cursor_context)
                 except Exception as e:
                     self.log_message(f"Refinement failed: {e}", is_error=True)
                     final = self.client._basic_cleanup(raw)

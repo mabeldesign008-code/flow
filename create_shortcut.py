@@ -45,3 +45,4 @@ if __name__ == "__main__":
         
     create_shortcut(startup=False) # Desktop
     create_shortcut(startup=True)  # Startup
+    create_shortcut(startup=False)

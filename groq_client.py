@@ -51,7 +51,7 @@ class GroqClient:
 
     # ── public API ─────────────────────────────────────────────
 
-    async def refine(self, text: str, allow_fallback: bool = True) -> str:
+    async def refine(self, text: str, allow_fallback: bool = True, cursor_context: str = "") -> str:
         if not text or not text.strip():
             return text or ""
 
@@ -60,15 +60,20 @@ class GroqClient:
             await asyncio.sleep(self.min_request_interval - elapsed)
 
         prompt = (
-            self._prompt_articulate() if self.articulate_mode
-            else self._prompt_standard()
+            self._prompt_articulate(cursor_context) if self.articulate_mode
+            else self._prompt_standard(cursor_context)
         )
+
+        # Prepend cursor context to the user message if available
+        user_message = text
+        if cursor_context:
+            user_message = f"[CONTEXT: {cursor_context}]\n\n{text}"
 
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": prompt},
-                {"role": "user", "content": text},
+                {"role": "user", "content": user_message},
             ],
             "temperature": 0.0,
             "max_tokens": max(len(text.split()) * 4, 256),
@@ -109,8 +114,12 @@ class GroqClient:
             f"  [{i+1}] {t}" for i, t in enumerate(self.context_window)
         )
 
-    def _prompt_standard(self) -> str:
+    def _prompt_standard(self, cursor_context: str = "") -> str:
         ctx = self._build_context()
+        context_section = ""
+        if cursor_context:
+            context_section = f"\nCursor Context (what the user is currently working on):\n{cursor_context}\n"
+        
         return (
             "You are an English speech-to-text error corrector. "             # 🔒 ENGLISH-ONLY
             "You receive a raw English transcription and output a corrected version.\n\n"
@@ -124,18 +133,25 @@ class GroqClient:
             "5. Fix punctuation and capitalization.\n"
             "6. NEVER flip negations — carefully preserve 'can' vs 'can't', etc.\n"
             "7. Convert spoken numbers when natural (twenty percent → 20%).\n"
-            "8. Use the recent context below to resolve ambiguous references "
+            "8. Use the recent context below AND the cursor context to resolve ambiguous references "
             "(e.g. 'that one', 'the same thing', pronouns).\n"
             "9. The input is ALWAYS English. If any word looks like another language, "   # 🔒
             "it is a misheard English word — correct it using context.\n"                 # 🔒
-            "10. Output must be English only.\n\n"                                        # 🔒
-            f"Recent context:\n{ctx}\n\n"
+            "10. Output must be English only.\n"                                        # 🔒
+            "11. If cursor context shows the user is working in a specific domain "
+            "(code, email, document), use that to improve technical term accuracy.\n\n"
+            f"Recent context:\n{ctx}\n"
+            f"{context_section}\n"
             "Output ONLY the corrected text. "
             "No quotes, no explanation, no commentary."
         )
 
-    def _prompt_articulate(self) -> str:
+    def _prompt_articulate(self, cursor_context: str = "") -> str:
         ctx = self._build_context()
+        context_section = ""
+        if cursor_context:
+            context_section = f"\nCursor Context (what the user is currently working on):\n{cursor_context}\n"
+        
         return (
             "You are an English speech articulation engine. "                 # 🔒 ENGLISH-ONLY
             "Transform raw, rambling English speech into clear, polished, professional text.\n\n"
@@ -152,8 +168,11 @@ class GroqClient:
             "8. Never drop important context or qualifiers.\n"
             "9. The input is ALWAYS English. Treat any non-English-looking word "         # 🔒
             "as a misheard English word and correct it from context.\n"                   # 🔒
-            "10. Output must be English only.\n\n"                                        # 🔒
-            f"Recent context:\n{ctx}\n\n"
+            "10. Output must be English only.\n"                                        # 🔒
+            "11. If cursor context shows the user is working in a specific domain "
+            "(code, email, document), adapt vocabulary and style appropriately.\n\n"
+            f"Recent context:\n{ctx}\n"
+            f"{context_section}\n"
             "Output ONLY the refined text. "
             "No quotes, no explanation, no commentary."
         )

@@ -1,0 +1,26 @@
+# Core dependencies
+python-dotenv
+pyperclip
+keyboard
+pynput
+httpx[http2]
+
+# Audio processing
+sounddevice
+numpy
+scipy
+
+# Speech recognition
+sherpa-onnx
+
+# GUI
+Pillow
+pystray
+
+# Screen Context - OCR (choose one)
+# PaddleOCR (fastest, recommended)
+paddlepaddle
+paddleocr
+
+# OR EasyOCR (slower fallback)
+# easyocr
