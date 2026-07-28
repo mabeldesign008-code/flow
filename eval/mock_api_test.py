@@ -121,7 +121,7 @@ async def main():
 
     print("\n=== 2. Request payload ===")
     sub = STATE["submitted"]
-    check("model sent", sub.get("speech_model") == "universal-3-5-pro", str(sub.get("speech_model")))
+    check("model sent", sub.get("speech_models") == ["universal-3-5-pro"], str(sub.get("speech_models")))
     check("keyterms sent", sub.get("keyterms_prompt") == ["Kubernetes", "WhisprFlow"], str(sub.get("keyterms_prompt")))
     check("format_text on", sub.get("format_text") is True)
     check("disfluencies off", sub.get("disfluencies") is False)
@@ -159,31 +159,6 @@ async def main():
     r = await bad.transcribe(audio, sr)
     check("no key -> ok=False", not r.ok and "key" in (r.error or "").lower())
     await bad.close()
-
-    print("\n=== 6. Fallback via router ===")
-    from stt.router import EngineRouter
-    from stt.base import TranscriptionResult
-
-    class DeadCloud:
-        name, is_configured = "assemblyai", True
-        async def transcribe(self, *a, **k):
-            return TranscriptionResult.failure("network unreachable")
-        async def close(self): pass
-        def preload(self): pass
-        def get_info(self): return {}
-
-    class GoodLocal:
-        name = "local"
-        async def transcribe(self, *a, **k):
-            return TranscriptionResult(text="offline transcript", ok=True, engine="local")
-        async def close(self): pass
-        def preload(self): pass
-        def get_info(self): return {}
-
-    events = []
-    r = await EngineRouter(DeadCloud(), GoodLocal(), on_event=events.append).transcribe(audio, sr)
-    check("fell back to local", r.ok and r.text == "offline transcript", r.text)
-    check("fallback logged", any("falling back" in e for e in events), str(events))
 
     await client.close()
     srv.shutdown()

@@ -3,11 +3,10 @@ User dictionary -- names, jargon, acronyms, product names.
 
 This is the highest-ROI accuracy feature in dictation software and the app
 had none. Terms flow to:
-  * AssemblyAI  -> keyterms_prompt (semantic biasing, supported on
-                   universal-3-5-pro / universal-3-pro / slam-1)
-  * local       -> sherpa-onnx hotwords_file (transducer models only)
-  * LLM         -> the refinement prompt, so it stops "correcting" your
-                   product names into ordinary English words
+  * AssemblyAI -> keyterms_prompt (semantic biasing, supported on
+                  universal-3-5-pro / universal-3-pro / slam-1)
+  * LLM        -> the refinement prompt AND the guard, so a rewrite that
+                  drops one of your product names is rejected outright
 
 Stored as plain text at %APPDATA%/WhisprFlow/user_dictionary.txt so the
 user can edit it by hand. One term per line, # for comments.
@@ -153,15 +152,3 @@ class UserDictionary:
         """Compact form for the LLM refinement prompt."""
         t = self.terms[:limit]
         return ", ".join(t) if t else ""
-
-    def write_hotwords_file(self, dest: Optional[Path] = None) -> Optional[str]:
-        """Write a sherpa-onnx hotwords file (uppercase, one per line)."""
-        terms = self.terms
-        if not terms:
-            return None
-        dest = Path(dest) if dest else self.path.parent / "hotwords.txt"
-        try:
-            dest.write_text("\n".join(t.upper() for t in terms) + "\n", encoding="utf-8")
-            return str(dest)
-        except Exception:
-            return None

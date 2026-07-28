@@ -1,20 +1,15 @@
-"""Pluggable speech-to-text engines for WhisprFlow."""
+"""Speech-to-text for WhisprFlow. AssemblyAI only -- no fallback engines."""
 
-from .base import TranscriptionEngine, TranscriptionResult, WordInfo, float_to_wav_bytes
-from .assemblyai_client import AssemblyAIClient
-from .local_client import LocalSherpaClient
-from .router import EnginePolicy, EngineRouter
+from .base import TranscriptionResult, WordInfo, float_to_wav_bytes
+from .assemblyai_client import AssemblyAIClient, clean_keyterms
 from .dictionary import UserDictionary, default_config_dir
 
 __all__ = [
-    "TranscriptionEngine",
     "TranscriptionResult",
     "WordInfo",
     "float_to_wav_bytes",
     "AssemblyAIClient",
-    "LocalSherpaClient",
-    "EngineRouter",
-    "EnginePolicy",
+    "clean_keyterms",
     "UserDictionary",
     "default_config_dir",
 ]

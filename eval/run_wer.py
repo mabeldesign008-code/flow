@@ -9,10 +9,9 @@ Setup
 3. Write eval/reference.jsonl, one JSON object per line:
        {"file": "clip001.wav", "text": "the exact words you said"}
 4. Run:
-       python eval/run_wer.py --engine assemblyai
-       python eval/run_wer.py --engine local --local-model parakeet
-       python eval/run_wer.py --engine local --local-model sensevoice
-       python eval/run_wer.py --engine assemblyai --dictionary
+       python eval/run_wer.py
+       python eval/run_wer.py --dictionary
+       python eval/run_wer.py --model universal-2
 
 Compare the WER columns. That number is the only honest way to decide
 whether a model change actually helped.
@@ -31,7 +30,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from stt import AssemblyAIClient, LocalSherpaClient, UserDictionary  # noqa: E402
+from stt import AssemblyAIClient, UserDictionary  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 CLIPS = ROOT / "clips"
@@ -100,19 +99,9 @@ def load_wav(path: Path):
     return audio, sr
 
 
-def build_engine(args):
-    if args.engine == "assemblyai":
-        return AssemblyAIClient(model=args.model)
-    engine = LocalSherpaClient(model_type=args.local_model)
-    engine.preload()
-    return engine
-
-
 async def main():
     ap = argparse.ArgumentParser(description="Measure WER on your own clips")
-    ap.add_argument("--engine", choices=["assemblyai", "local"], default="assemblyai")
     ap.add_argument("--model", default="universal-3-5-pro", help="AssemblyAI model")
-    ap.add_argument("--local-model", default="parakeet", choices=["parakeet", "sensevoice"])
     ap.add_argument("--dictionary", action="store_true", help="Send user dictionary as keyterms")
     ap.add_argument("--reference", default=str(REFERENCE))
     ap.add_argument("--out", default="", help="Write per-clip JSON results here")
@@ -131,11 +120,10 @@ async def main():
         print("Reference file is empty.")
         return 1
 
-    engine = build_engine(args)
+    engine = AssemblyAIClient(model=args.model)
     keyterms = UserDictionary().as_keyterms() if args.dictionary else None
 
-    label = args.model if args.engine == "assemblyai" else args.local_model
-    print(f"\nEngine: {args.engine} / {label}")
+    print(f"\nModel:  {args.model}")
     print(f"Clips:  {len(entries)}   Dictionary: {len(keyterms) if keyterms else 0} terms")
     print("=" * 74)
 

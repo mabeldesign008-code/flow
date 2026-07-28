@@ -14,10 +14,8 @@ sounddevice>=0.4.6,<0.6.0
 numpy>=1.24.0,<3.0.0
 scipy>=1.11.0,<2.0.0
 
-# ── Speech recognition ────────────────────────────────────────────────
-# Cloud (primary): AssemblyAI over plain HTTP via httpx -- no SDK needed.
-# Local (fallback): sherpa-onnx running Parakeet TDT or SenseVoice.
-sherpa-onnx>=1.10.0,<2.0.0
+# Speech recognition is AssemblyAI over plain HTTP via httpx -- no SDK
+# (the official one is synchronous and would block the asyncio loop).
 
 # ── GUI ───────────────────────────────────────────────────────────────
 Pillow>=10.1.0,<12.0.0
@@ -26,13 +24,6 @@ pystray>=0.19.4,<0.20.0
 # ── Windows integration (shortcut creation) ───────────────────────────
 pywin32>=306; sys_platform == "win32"
 winshell>=0.6; sys_platform == "win32"
-
-# ── Screen context OCR (optional) ─────────────────────────────────────
-# PaddleOCR 3.x removed show_log/use_gpu kwargs and changed .ocr(); the
-# code targets the 2.7-2.9 API, so it is pinned. Being replaced by UI
-# Automation -- see AUDIT.md section 3.4.
-# paddlepaddle>=2.5.0,<3.0.0
-# paddleocr>=2.7.0,<3.0.0
 
 # ── Dev / test ────────────────────────────────────────────────────────
 pytest>=7.4.0,<9.0.0

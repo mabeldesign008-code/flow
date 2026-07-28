@@ -19,14 +19,8 @@ from pynput import keyboard
 from pynput.keyboard import Controller as KeyboardController
 
 from recorder import AudioRecorder
-from groq_client import GroqClient
-from stt import (
-    AssemblyAIClient,
-    EnginePolicy,
-    EngineRouter,
-    LocalSherpaClient,
-    UserDictionary,
-)
+from refine import Refiner, basic_cleanup
+from stt import AssemblyAIClient, UserDictionary
 from injector import TextInjector
 from dotenv import load_dotenv, set_key
 
@@ -340,7 +334,7 @@ class FloatingOverlay:
 
     def toggle_articulate_mode(self):
         self.articulate_mode = not self.articulate_mode
-        self.parent.client.articulate_mode = self.articulate_mode
+        self.parent.refiner.articulate_mode = self.articulate_mode
         mode = "Articulate" if self.articulate_mode else "Standard"
         self.parent.log_message(f"Mode: {mode}")
         winsound.Beep(1200 if self.articulate_mode else 800, 100)
@@ -357,26 +351,17 @@ class WhisprFlowApp:
     def __init__(self):
         self.env_path = Path(".env")
         self.recorder = AudioRecorder()
-        self.client = GroqClient()
+        self.refiner = Refiner(api_key=os.getenv("GROQ_API_KEY", ""))
         self.injector = TextInjector()
 
-        # ── Transcription: AssemblyAI cloud, local sherpa-onnx as fallback ──
+        # ── Transcription: AssemblyAI only. No local fallback: a silent
+        #    downgrade to a weaker model is worse than an honest error.
         self.dictionary = UserDictionary()
-        self.stt = EngineRouter(
-            cloud=AssemblyAIClient(
-                api_key=os.getenv("ASSEMBLYAI_API_KEY", ""),
-                model=os.getenv("ASSEMBLYAI_MODEL", "universal-3-5-pro"),
-            ),
-            local=LocalSherpaClient(
-                model_type=os.getenv("LOCAL_STT_MODEL", "parakeet"),
-            ),
-            policy=EnginePolicy(os.getenv("STT_POLICY", "cloud_first")),
-            on_event=lambda msg: self.log_message(msg),
+        self.stt = AssemblyAIClient(
+            api_key=os.getenv("ASSEMBLYAI_API_KEY", ""),
+            model=os.getenv("ASSEMBLYAI_MODEL", "universal-3-5-pro"),
         )
-        
-        # ── Screen context capture (OCR) ──
-        from screen_context import ScreenContext
-        self.screen_context = ScreenContext()
+
 
         # ── CHANGED: thread-safe recording flag ──
         self._state_lock = threading.Lock()
@@ -417,8 +402,9 @@ class WhisprFlowApp:
         self.root.withdraw()
         self.icon = self._create_tray_icon()
 
-        # ── Warm the local fallback model in the background ──
-        self.stt.preload()
+        # Open the HTTPS connection so the first dictation isn't slowed
+        # by a cold TLS handshake.
+        threading.Thread(target=self._warm_connection, daemon=True).start()
 
         self.log_message("System ready.  Hold Ctrl+Win to record.")
         print("WhisprFlow started.")
@@ -467,18 +453,17 @@ class WhisprFlowApp:
         ec = tk.Frame(eng, bg="#2d2d2d")
         ec.pack(fill="x", padx=20, pady=(0, 20))
         info = self.stt.get_info()
-        cloud_ok = info["cloud"]["configured"]
-        Label(ec, text=f"AssemblyAI {info['cloud']['model']}",
+        ok = info["configured"]
+        Label(ec, text=f"AssemblyAI {info['model']}",
               font=("Segoe UI", 12, "bold"),
-              fg="#4CAF50" if cloud_ok else "#FF9800",
+              fg="#4CAF50" if ok else "#FF9800",
               bg="#2d2d2d").pack(anchor="w")
         Label(ec,
-              text=("English • Cloud • Keyterms enabled" if cloud_ok
-                    else "No API key — add one below to enable cloud accuracy"),
+              text=("English • Keyterms enabled" if ok
+                    else "No API key — add one below to enable transcription"),
               font=("Segoe UI", 9), fg="#888", bg="#2d2d2d").pack(anchor="w")
         self.engine_status_label = Label(
-            ec, text=f"Fallback: local {info['local']['model']} • "
-                     f"Dictionary: {len(self.dictionary)} terms",
+            ec, text=f"Dictionary: {len(self.dictionary)} terms",
             font=("Segoe UI", 8), fg="#666", bg="#2d2d2d")
         self.engine_status_label.pack(anchor="w", pady=(2, 10))
 
@@ -511,7 +496,6 @@ class WhisprFlowApp:
         self.rate_limit_label = Label(rlf, text="", font=("Segoe UI", 8),
                                       fg="#888", bg="#2d2d2d")
         self.rate_limit_label.pack(side="left")
-        self._btn(rlf, "Reset Limits", self._reset_rate_limits, "#607D8B").pack(side="right")
 
         # ── log card ──
         log = self._card(main, "📝 Activity Log")
@@ -559,36 +543,31 @@ class WhisprFlowApp:
 
     def _periodic_status(self):
         try:
-            self._update_rate_limit_label()
+            self._update_refiner_label()
         except Exception:
             pass
         self.root.after(5000, self._periodic_status)
 
-    def _update_rate_limit_label(self):
+    def _update_refiner_label(self):
         if not self.refinement_enabled.get():
-            self.rate_limit_label.config(text="Refinement disabled", fg="#FF9800")
+            self.rate_limit_label.config(text="Refinement off — raw transcript", fg="#FF9800")
             return
-        s = self.client.get_rate_limit_status()
-        rc = s["retry_count"]
-        mx = s["max_retries"]
-        if rc == 0:
-            self.rate_limit_label.config(text="✅ API ready", fg="#4CAF50")
-        elif rc < mx:
-            self.rate_limit_label.config(text=f"⚠️ Retry {rc}/{mx}", fg="#FF9800")
+        if not self.refiner.is_configured:
+            self.rate_limit_label.config(text="No Groq key — raw transcript", fg="#FF9800")
+            return
+        st = self.refiner.get_stats()
+        if st["rejections"]:
+            self.rate_limit_label.config(
+                text=f"Guard blocked {st['rejections']}/{st['calls']} rewrites", fg="#FF9800")
         else:
-            self.rate_limit_label.config(text="❌ Rate limit — using fallback", fg="#FF5252")
+            self.rate_limit_label.config(text=f"Refiner ready ({st['model']})", fg="#4CAF50")
 
     def _on_refinement_toggle(self):
         if self.refinement_enabled.get():
-            self.client.reset_rate_limit_count()
-            self.log_message("✅ Refinement enabled")
+            self.log_message("Refinement enabled")
         else:
-            self.log_message("⚠️ Refinement disabled — raw transcription only")
-
-    def _reset_rate_limits(self):
-        self.client.reset_rate_limit_count()
-        self._update_rate_limit_label()
-        self.log_message("🔄 Rate limit counters reset")
+            self.log_message("Refinement disabled — raw transcript only")
+        self._update_refiner_label()
 
     # ── logging ────────────────────────────────────────────────
 
@@ -616,10 +595,9 @@ class WhisprFlowApp:
             self.env_path.touch()
         set_key(str(self.env_path), "GROQ_API_KEY", key)
         os.environ["GROQ_API_KEY"] = key
-        self.client.api_key = key
-        # ── CHANGED: update existing client headers ──
-        self.client._client = None  # Force re-creation with new key
+        self.refiner.set_api_key(key)
         self.log_message("Groq API key saved.")
+        self._update_refiner_label()
 
     def save_assemblyai_key(self):
         key = self.aai_entry.get().strip()
@@ -630,9 +608,15 @@ class WhisprFlowApp:
             self.env_path.touch()
         set_key(str(self.env_path), "ASSEMBLYAI_API_KEY", key)
         os.environ["ASSEMBLYAI_API_KEY"] = key
-        self.stt.cloud.set_api_key(key)
+        self.stt.set_api_key(key)
         self.log_message("AssemblyAI key saved — cloud transcription enabled.")
         asyncio.run_coroutine_threadsafe(self.stt.warmup(), self.loop)
+
+    def _warm_connection(self):
+        try:
+            asyncio.run_coroutine_threadsafe(self.stt.warmup(), self.loop)
+        except Exception:
+            pass
 
     # ── window / tray ──────────────────────────────────────────
 
@@ -657,7 +641,7 @@ class WhisprFlowApp:
             self.icon.stop()
         # Close persistent HTTP client
         try:
-            asyncio.run_coroutine_threadsafe(self.client.close(), self.loop).result(timeout=5)
+            asyncio.run_coroutine_threadsafe(self.refiner.close(), self.loop).result(timeout=5)
             asyncio.run_coroutine_threadsafe(self.stt.close(), self.loop).result(timeout=5)
         except Exception:
             pass
@@ -723,12 +707,17 @@ class WhisprFlowApp:
         if self.is_cancelled:
             return
         try:
-            # Step 1: transcription (AssemblyAI, local fallback)
+            # ── Step 1: transcription ──
             self.log_message("Transcribing...")
             result = await self.stt.transcribe(
                 samples, sample_rate, keyterms=self.dictionary.as_keyterms()
             )
             self.last_stt_result = result
+
+            # Cancelled while the request was in flight? Do not inject into
+            # whatever window the user has moved on to.
+            if self.is_cancelled:
+                return
 
             # A failure and genuine silence are different things and must
             # produce different UI. Only a failure is worth retrying.
@@ -747,37 +736,35 @@ class WhisprFlowApp:
 
             if DEBUG:
                 self.log_message(
-                    f"[RAW] ({result.engine}/{result.model}, "
-                    f"{result.latency_ms}ms, conf={result.confidence:.2f}) {raw}"
+                    f"[RAW] ({result.model}, {result.latency_ms}ms, "
+                    f"conf={result.confidence:.2f}) {raw}"
                 )
 
-            # Step 2: refinement
-            if self.refinement_enabled.get():
-                self.log_message("Refining via Groq...")
-                try:
-                    # ── Capture screen context for context-aware refinement ──
-                    cursor_context = ""
-                    if self.screen_context.enabled:
-                        try:
-                            cursor_context = self.screen_context.get_context_for_llm(max_words=150)
-                            if cursor_context and DEBUG:
-                                self.log_message(f"[CONTEXT] {cursor_context[:100]}...")
-                        except Exception as ctx_err:
-                            if DEBUG:
-                                self.log_message(f"[CONTEXT] Error: {ctx_err}")
-                    
-                    final = await self.client.refine(raw, allow_fallback=True, cursor_context=cursor_context)
-                except Exception as e:
-                    self.log_message(f"Refinement failed: {e}", is_error=True)
-                    final = self.client._basic_cleanup(raw)
-                self._update_rate_limit_label_safe()
+            # ── Step 2: refinement, guarded ──
+            if self.refinement_enabled.get() and self.refiner.is_configured:
+                uncertain = [w.text for w in result.low_confidence_words()]
+                final = await self.refiner.refine(
+                    raw,
+                    uncertain_words=uncertain,
+                    dictionary_terms=self.dictionary.as_keyterms(),
+                )
+                if self.refiner.last_rejected:
+                    # The rewrite looked like a hallucination and was
+                    # discarded. The raw transcript is used instead.
+                    self.log_message(
+                        f"Refinement rejected ({self.refiner.last_rejected}) — using raw text."
+                    )
+                self._update_refiner_label_safe()
             else:
-                final = self.client._basic_cleanup(raw)
+                final = basic_cleanup(raw)
 
-            # Step 3: inject
-            self.log_message(f"✓ {final[:60]}{'…' if len(final) > 60 else ''}")
+            if self.is_cancelled:
+                return
+
+            # ── Step 3: inject ──
+            self.log_message(f"\u2713 {final[:60]}{'\u2026' if len(final) > 60 else ''}")
             self.last_text_injected = final
-            self.injector.inject(final)
+            await asyncio.to_thread(self.injector.inject, final)
             self.overlay.trigger_success()
             self.last_transcription_failed = False
 
@@ -787,9 +774,9 @@ class WhisprFlowApp:
             if DEBUG:
                 traceback.print_exc()
 
-    def _update_rate_limit_label_safe(self):
+    def _update_refiner_label_safe(self):
         try:
-            self.root.after(0, self._update_rate_limit_label)
+            self.root.after(0, self._update_refiner_label)
         except Exception:
             pass
 
@@ -811,10 +798,15 @@ class WhisprFlowApp:
 
     async def _retry_refinement(self):
         try:
-            final = await self.client.refine(self.last_raw_text)
-            self.log_message(f"✓ (retry) {final[:60]}…")
+            final = await self.refiner.refine(
+                self.last_raw_text,
+                dictionary_terms=self.dictionary.as_keyterms(),
+            )
+            if self.is_cancelled:
+                return
+            self.log_message(f"\u2713 (retry) {final[:60]}")
             self.last_text_injected = final
-            self.injector.inject(final)
+            await asyncio.to_thread(self.injector.inject, final)
             self.overlay.trigger_success()
             self.last_transcription_failed = False
         except Exception as e:
