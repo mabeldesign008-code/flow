@@ -68,6 +68,7 @@ models/*
 *.onnx
 
 # Eval data (your own recordings + transcripts)
-eval/clips/
+eval/clips/*
+!eval/clips/.gitkeep
 eval/reference.jsonl
 eval/results*.json

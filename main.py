@@ -1,30 +1,38 @@
+"""
+WhisprFlow — system-wide AI dictation for Windows.
+
+Pipeline:  hotkey → always-on capture (with pre-roll) → AssemblyAI
+           → Groq refinement → hallucination guard → inject at cursor
+"""
+
 import asyncio
-import os
-import re
-import math
-import time
-import threading
-import traceback
 import ctypes
+import logging
+import os
+import threading
+import time
+import traceback
 import winsound
 from datetime import datetime
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox, Label, Entry, Button, scrolledtext, Canvas
+from tkinter import Label, messagebox, scrolledtext
 
-from PIL import Image, ImageDraw, ImageTk, ImageFont, ImageFilter
 import pystray
+from dotenv import load_dotenv, set_key
+from PIL import Image, ImageDraw
 from pynput import keyboard
 from pynput.keyboard import Controller as KeyboardController
 
-from recorder import AudioRecorder
-from refine import Refiner, basic_cleanup
-from stt import AssemblyAIClient, UserDictionary
+from audio import AudioCapture, process as process_audio
 from injector import TextInjector
-from dotenv import load_dotenv, set_key
+from refine import Refiner, basic_cleanup
+from stt import AssemblyAIClient, UserDictionary, default_config_dir
+from ui import theme
+from ui.overlay import FloatingPill, PillState
 
-# ── High-DPI awareness ────────────────────────────────────────
+# High-DPI awareness so the overlay renders crisply.
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
 except Exception:
@@ -33,834 +41,583 @@ except Exception:
     except Exception:
         pass
 
-load_dotenv()
+CONFIG_DIR = default_config_dir()
+ENV_PATH = CONFIG_DIR / ".env"
+load_dotenv(ENV_PATH)
+load_dotenv()  # also honour a project-local .env during development
 
-DEBUG = False  # Flip to True for verbose console output
+DEBUG = os.getenv("WHISPRFLOW_DEBUG", "").lower() in ("1", "true", "yes")
 
-
-# ══════════════════════════════════════════════════════════════
-#  Spring physics (unchanged — already clean)
-# ══════════════════════════════════════════════════════════════
-
-class Spring:
-    def __init__(self, value, stiffness=200, damping=20):
-        self.val = value
-        self.target = value
-        self.vel = 0.0
-        self.stiffness = stiffness
-        self.damping = damping
-
-    def update(self, dt=0.016):
-        force = (self.target - self.val) * self.stiffness
-        self.vel += (force - self.damping * self.vel) * dt
-        self.val += self.vel * dt
-        return self.val
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG else logging.INFO,
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+)
+logger = logging.getLogger("whisprflow")
 
 
-# ══════════════════════════════════════════════════════════════
-#  Floating Overlay  — 15 fps idle / 30 fps recording
-#                    — 2× supersampling (was 4×)
-#                    — NO gaussian blur
-# ══════════════════════════════════════════════════════════════
-
-class FloatingOverlay:
-    # ── CHANGED: reduced constants ──
-    SS_SCALE = 2                # was 4
-    FPS_IDLE = 15               # was 60
-    FPS_ACTIVE = 30             # was 60
-    INTERVAL_IDLE = 1000 // FPS_IDLE
-    INTERVAL_ACTIVE = 1000 // FPS_ACTIVE
-
-    def __init__(self, parent):
-        self.parent = parent
-        self.root = tk.Toplevel(parent.root)
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.98)
-        self.root.configure(bg="black")
-        self.root.attributes("-transparentcolor", "black")
-
-        self.width = 180
-        self.mini_height = 2
-        self.expanded_height = 42
-        self.height_spring = Spring(self.mini_height, stiffness=250, damping=22)
-
-        self.expanded = False
-        self.photo = None
-        self.wave_history = [Spring(0.0, stiffness=300, damping=25) for _ in range(11)]
-        self.wave_lean_spring = Spring(0.0, stiffness=150, damping=15)
-        self.success_end_time = 0
-        self.wpm = 0
-        self.pulse_val = 0
-        self.last_update_time = time.time()
-        self.articulate_mode = False
-
-        self.screen_width = self.root.winfo_screenwidth()
-        self.screen_height = self.root.winfo_screenheight()
-        self.center_x = self.screen_width // 2
-        self.center_y = self.screen_height - 60
-
-        self.canvas = Canvas(
-            self.root, width=self.width, height=self.expanded_height,
-            bg="black", highlightthickness=0,
-        )
-        self.canvas.pack()
-        self.canvas.bind("<Button-1>", self.on_click)
-
-        # ── CHANGED: pre-load font once ──
-        try:
-            self._font = ImageFont.truetype("arial.ttf", 8 * self.SS_SCALE)
-        except Exception:
-            self._font = ImageFont.load_default()
-
-        self.update_position()
-        self._schedule_loop()
-
-    # ── CHANGED: adaptive frame interval ──
-    def _schedule_loop(self):
-        interval = self.INTERVAL_ACTIVE if self.parent.is_recording else self.INTERVAL_IDLE
-        self.update_position()
-        self.render()
-        self.root.after(interval, self._schedule_loop)
-
-    def update_position(self):
-        now = time.time()
-        dt = min(now - self.last_update_time, 0.05)
-        self.last_update_time = now
-
-        try:
-            mx, my = self.root.winfo_pointerxy()
-            mouse_near = abs(mx - self.center_x) < 120 and abs(my - self.center_y) < 80
-            self.expanded = mouse_near or self.parent.is_recording or self.parent.last_transcription_failed
-        except Exception:
-            self.expanded = self.parent.is_recording or self.parent.last_transcription_failed
-
-        self.height_spring.target = self.expanded_height if self.expanded else self.mini_height
-        h = self.height_spring.update(dt)
-
-        self.center_y = self.screen_height - 100
-        x = self.center_x - self.width // 2
-        y = self.center_y - int(h) // 2
-
-        try:
-            self.root.geometry(f"{self.width}x{int(max(1, h))}+{x}+{y}")
-        except Exception:
-            pass
-
-    def on_click(self, event):
-        if self.height_spring.val < self.expanded_height - 10:
-            return
-        x = event.x
-        if x > self.width - 45:
-            self.on_action_click()
-        elif x < 45:
-            self.on_cancel_click()
-        elif 60 < x < 120:
-            self.toggle_articulate_mode()
-
-    # ── rendering ──────────────────────────────────────────────
-
-    def render(self):
-        S = self.SS_SCALE
-        bw = self.width * S
-        bh = self.expanded_height * S
-        img = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-
-        h = self.height_spring.val
-        alpha = max(0.0, min(1.0,
-            (h - self.mini_height) / (self.expanded_height - 10 - self.mini_height + 1e-5)
-        ))
-
-        if h <= self.mini_height + 1:
-            jw = 60 * S
-            jx = (bw - jw) // 2
-            draw.rounded_rectangle(
-                [jx, 0, jx + jw, self.mini_height * S],
-                radius=1 * S, fill=(255, 255, 255, 180),
-            )
-        else:
-            # Pulse glow while recording
-            if self.parent.is_recording:
-                self.pulse_val = (math.sin(time.time() * 4) + 1) / 2
-                pa = int(30 * self.pulse_val * alpha)
-                draw.rounded_rectangle(
-                    [-5*S, -5*S, bw+5*S, bh+5*S],
-                    radius=30*S, outline=(0, 255, 255, pa), width=3*S,
-                )
-
-            bg_a = int(230 * alpha)
-            draw.rounded_rectangle(
-                [0, 0, bw, bh], radius=21*S,
-                fill=(18, 18, 20, bg_a),
-                outline=(0, 0, 0, int(150 * alpha)), width=2*S,
-            )
-            draw.rounded_rectangle(
-                [S, S, bw - S, bh - S], radius=20*S,
-                outline=(255, 255, 255, int(45 * alpha)), width=S,
-            )
-
-            if alpha > 0.6:
-                self._draw_left_button(draw, bw, bh, S, alpha)
-                self._draw_waves(draw, bw, bh, S, alpha)
-                self._draw_mode_indicator(draw, bw, bh, S, alpha)
-                self._draw_success(draw, bw, bh, S, alpha)
-                self._draw_right_button(draw, bw, bh, S, alpha)
-
-        # ── CHANGED: 2× downsample, no blur ──
-        final = img.resize((self.width, self.expanded_height), Image.Resampling.LANCZOS)
-        self.photo = ImageTk.PhotoImage(final)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
-
-    # ── sub-draw helpers (extracted for clarity) ───────────────
-
-    def _draw_left_button(self, draw, bw, bh, S, alpha):
-        show = self.parent.is_recording or self.parent.last_transcription_failed
-        if not show:
-            return
-        col = (255, 50, 50, 255) if self.parent.last_transcription_failed else (50, 50, 50, 255)
-        draw.ellipse([12*S, 8*S, 34*S, 30*S], fill=col)
-        cx, cy = 23*S, 19*S
-        if self.parent.last_transcription_failed:
-            r = 5 * S
-            draw.arc([cx-r, cy-r, cx+r, cy+r], start=0, end=270, fill="white", width=2*S)
-            draw.polygon([cx+r, cy, cx+r-3*S, cy-3*S, cx+r+3*S, cy-3*S], fill="white")
-        else:
-            xs = 5 * S
-            draw.line([cx-xs, cy-xs, cx+xs, cy+xs], fill="white", width=2*S)
-            draw.line([cx+xs, cy-xs, cx-xs, cy+xs], fill="white", width=2*S)
-
-    def _draw_waves(self, draw, bw, bh, S, alpha):
-        num_bars = 11
-        cx, cy = bw // 2, bh // 2
-        bar_w = 4 * S
-        gap = 5 * S
-
-        raw_level = self.parent.recorder.get_level() if self.parent.is_recording else 0.005
-        level = min(1.0, raw_level * 20)
-
-        try:
-            mx, _ = self.root.winfo_pointerxy()
-            rel_mx = (mx - self.center_x) / (self.width / 2)
-        except Exception:
-            rel_mx = 0
-
-        self.wave_lean_spring.target = rel_mx if abs(rel_mx) < 1.5 else 0
-        lean = self.wave_lean_spring.update(0.016) * 3 * S
-
-        t = time.time()
-        for i in range(num_bars):
-            if self.parent.is_recording:
-                var = 0.6 + 0.4 * math.sin(t * 12 + i * 0.7)
-                target_h = 4*S + level * 25 * S * var
-            else:
-                target_h = 4*S + 2*S * math.sin(t * 3 + i)
-
-            self.wave_history[i].target = target_h
-            h = self.wave_history[i].update(0.016)
-
-            offset = i - num_bars // 2
-            bx = cx + offset * (bar_w + gap) + lean
-
-            if self.parent.is_recording:
-                # ── CHANGED: draw glow directly, no separate bloom layer / blur ──
-                r = int(min(255, max(0, 100 + level * 155)))
-                g = int(min(255, max(0, 200 - level * 50)))
-                glow_a = int(60 * alpha)
-                draw.rounded_rectangle(
-                    [bx-bar_w//2-2*S, cy-h//2-2*S, bx+bar_w//2+2*S, cy+h//2+2*S],
-                    radius=4*S, fill=(r, g, 255, glow_a),
-                )
-                draw.rounded_rectangle(
-                    [bx-bar_w//2, cy-h//2, bx+bar_w//2, cy+h//2],
-                    radius=2*S, fill=(255, 255, 255, int(255*alpha)),
-                )
-            else:
-                draw.rounded_rectangle(
-                    [bx-bar_w//2-S, cy-h//2-S, bx+bar_w//2+S, cy+h//2+S],
-                    radius=3*S, fill=(100, 100, 100, int(30*alpha)),
-                )
-                draw.rounded_rectangle(
-                    [bx-bar_w//2, cy-h//2, bx+bar_w//2, cy+h//2],
-                    radius=2*S, fill=(255, 255, 255, int(120*alpha)),
-                )
-
-    def _draw_mode_indicator(self, draw, bw, bh, S, alpha):
-        if alpha <= 0.7:
-            return
-        label = "A" if self.articulate_mode else "S"
-        col = (100, 200, 255, int(255*alpha)) if self.articulate_mode else (150, 150, 150, int(180*alpha))
-        ix, iy, ir = bw // 2, bh - 8*S, 6*S
-        draw.ellipse([ix-ir, iy-ir, ix+ir, iy+ir], fill=col)
-        bb = draw.textbbox((0, 0), label, font=self._font)
-        tw, th = bb[2] - bb[0], bb[3] - bb[1]
-        draw.text((ix - tw//2, iy - th//2), label, fill=(255, 255, 255, int(255*alpha)), font=self._font)
-
-    def _draw_success(self, draw, bw, bh, S, alpha):
-        if time.time() >= self.success_end_time:
-            return
-        font = ImageFont.load_default(size=9 * S)
-        draw.text(
-            (bw//2 - 28*S, bh//2 - 6*S), "READY",
-            fill=(100, 255, 100, int(255*alpha)), font=font,
-        )
-
-    def _draw_right_button(self, draw, bw, bh, S, alpha):
-        if self.parent.is_recording:
-            pulse_r = int(12*S * (1 + 0.1 * math.sin(time.time() * 8)))
-            bx, by = bw - 23*S, 19*S
-            draw.ellipse([bx-pulse_r, by-pulse_r, bx+pulse_r, by+pulse_r], fill=(255, 255, 255, 255))
-            s = 4 * S
-            draw.rectangle([bx-s, by-s, bx+s, by+s], fill=(255, 50, 50, 255))
-        else:
-            draw.ellipse([bw-34*S, 8*S, bw-12*S, 30*S], fill=(255, 50, 50, 255))
-            cx, cy, r = bw-23*S, 19*S, 4*S
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=(255, 255, 255, 255))
-
-    # ── actions ────────────────────────────────────────────────
-
-    def on_action_click(self):
-        if self.parent.is_recording:
-            self.parent.stop_recording_sequence()
-        else:
-            self.parent.start_recording_sequence()
-
-    def on_cancel_click(self):
-        if self.parent.is_recording:
-            self.parent.cancel_recording_sequence()
-        elif self.parent.last_transcription_failed:
-            self.parent.retry_processing_sequence()
-
-    def toggle_articulate_mode(self):
-        self.articulate_mode = not self.articulate_mode
-        self.parent.refiner.articulate_mode = self.articulate_mode
-        mode = "Articulate" if self.articulate_mode else "Standard"
-        self.parent.log_message(f"Mode: {mode}")
-        winsound.Beep(1200 if self.articulate_mode else 800, 100)
-
-    def trigger_success(self):
-        self.success_end_time = time.time() + 2.0
+def beep_async(freq: int, ms: int) -> None:
+    """Never block the caller. The old code called winsound.Beep inline
+    before opening the mic, which is how the first syllable got clipped."""
+    threading.Thread(
+        target=lambda: _safe_beep(freq, ms), daemon=True
+    ).start()
 
 
-# ══════════════════════════════════════════════════════════════
-#  Main Application
-# ══════════════════════════════════════════════════════════════
+def _safe_beep(freq: int, ms: int) -> None:
+    try:
+        winsound.Beep(freq, ms)
+    except Exception:
+        pass
+
 
 class WhisprFlowApp:
     def __init__(self):
-        self.env_path = Path(".env")
-        self.recorder = AudioRecorder()
-        self.refiner = Refiner(api_key=os.getenv("GROQ_API_KEY", ""))
-        self.injector = TextInjector()
-
-        # ── Transcription: AssemblyAI only. No local fallback: a silent
-        #    downgrade to a weaker model is worse than an honest error.
         self.dictionary = UserDictionary()
+        self.injector = TextInjector()
+        self.refiner = Refiner(api_key=os.getenv("GROQ_API_KEY", ""))
         self.stt = AssemblyAIClient(
             api_key=os.getenv("ASSEMBLYAI_API_KEY", ""),
             model=os.getenv("ASSEMBLYAI_MODEL", "universal-3-5-pro"),
         )
 
+        # Always-on capture. The stream opens once and stays open, so the
+        # pre-roll ring already holds the moment before the hotkey fired.
+        self.capture = AudioCapture()
 
-        # ── CHANGED: thread-safe recording flag ──
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()
         self.is_recording = False
-        self.is_cancelled = False
-        self.last_transcription_failed = False
+        self.generation = 0          # bumped on cancel to invalidate in-flight work
         self.last_raw_text = ""
-        self.last_stt_result = None
-        self.last_audio_data = None       # (np.ndarray, sr)  for retry
-        self.last_audio_path = None       # file path fallback for retry
+        self.last_audio = None
         self.last_text_injected = ""
-        self.recording_duration = 0.0
-        self.start_time = 0.0
+        self.last_failed = False
+        self._start_time = 0.0
 
-        # ── async loop on a background thread ──
         self.loop = asyncio.new_event_loop()
 
-        # ── hotkeys ──
+        # Hotkeys
         self.hotkey_combo = {keyboard.Key.ctrl_l, keyboard.Key.cmd}
         self.pressed_keys = set()
-        self.undo_hotkey = "<ctrl>+<alt>+z"
         self.kb_controller = KeyboardController()
 
-        # ── GUI ──
+        # Window
         self.root = tk.Tk()
-        self.root.title("WhisprFlow — AI Speech Recognition")
-        self.root.geometry("700x800")
-        self.root.resizable(True, True)
-        self.root.configure(bg="#1a1a1a")
-        try:
-            self.root.attributes("-alpha", 0.98)
-        except Exception:
-            pass
+        self.root.title("WhisprFlow")
+        self.root.geometry("640x720")
+        self.root.configure(bg=theme.HEX_BG_APP)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
-        self.setup_gui()
-        self.overlay = FloatingOverlay(self)
-        self.root.withdraw()
-        self.icon = self._create_tray_icon()
-
-        # Open the HTTPS connection so the first dictation isn't slowed
-        # by a cold TLS handshake.
-        threading.Thread(target=self._warm_connection, daemon=True).start()
-
-        self.log_message("System ready.  Hold Ctrl+Win to record.")
-        print("WhisprFlow started.")
-
-    # ══════════════════════════════════════════════════════════
-    #  GUI setup  (mostly unchanged — trimmed for brevity
-    #              where styling-only code repeats)
-    # ══════════════════════════════════════════════════════════
-
-    def setup_gui(self):
-        self.root.configure(bg="#1a1a1a")
-        main = tk.Frame(self.root, bg="#1a1a1a")
-        main.pack(fill="both", expand=True, padx=20, pady=20)
-
-        # ── header ──
-        hdr = tk.Frame(main, bg="#2d2d2d")
-        hdr.pack(fill="x", pady=(0, 20))
-        tf = tk.Frame(hdr, bg="#2d2d2d")
-        tf.pack(pady=20)
-        Label(tf, text="WhisprFlow", font=("Segoe UI", 24, "bold"),
-              fg="#fff", bg="#2d2d2d").pack()
-        Label(tf, text="AI-Powered Speech Recognition",
-              font=("Segoe UI", 11), fg="#888", bg="#2d2d2d").pack()
-        self.status_indicator = Canvas(tf, width=12, height=12,
-                                       bg="#2d2d2d", highlightthickness=0)
-        self.status_indicator.pack(pady=5)
-        self.status_indicator.create_oval(2, 2, 10, 10, fill="#4CAF50", outline="")
-
-        # ── API key card ──
-        api_card = self._card(main, "🔑 API Configuration")
-        ac = tk.Frame(api_card, bg="#2d2d2d")
-        ac.pack(fill="x", padx=20, pady=(0, 20))
-        Label(ac, text="Groq API Key", font=("Segoe UI", 10, "bold"),
-              fg="#fff", bg="#2d2d2d").pack(anchor="w", pady=(0, 5))
-        af = tk.Frame(ac, bg="#2d2d2d")
-        af.pack(fill="x", pady=(0, 10))
-        self.api_entry = tk.Entry(af, font=("Segoe UI", 10), bg="#3d3d3d",
-                                  fg="#fff", insertbackground="#fff",
-                                  relief="flat", show="*")
-        self.api_entry.insert(0, os.getenv("GROQ_API_KEY", ""))
-        self.api_entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 10))
-        self._btn(af, "Save", self.save_settings, "#4CAF50").pack(side="right")
-
-        # ── engine card ──
-        eng = self._card(main, "⚡ Transcription Engine")
-        ec = tk.Frame(eng, bg="#2d2d2d")
-        ec.pack(fill="x", padx=20, pady=(0, 20))
-        info = self.stt.get_info()
-        ok = info["configured"]
-        Label(ec, text=f"AssemblyAI {info['model']}",
-              font=("Segoe UI", 12, "bold"),
-              fg="#4CAF50" if ok else "#FF9800",
-              bg="#2d2d2d").pack(anchor="w")
-        Label(ec,
-              text=("English • Keyterms enabled" if ok
-                    else "No API key — add one below to enable transcription"),
-              font=("Segoe UI", 9), fg="#888", bg="#2d2d2d").pack(anchor="w")
-        self.engine_status_label = Label(
-            ec, text=f"Dictionary: {len(self.dictionary)} terms",
-            font=("Segoe UI", 8), fg="#666", bg="#2d2d2d")
-        self.engine_status_label.pack(anchor="w", pady=(2, 10))
-
-        # ── AssemblyAI key ──
-        Label(ec, text="AssemblyAI API Key", font=("Segoe UI", 10, "bold"),
-              fg="#fff", bg="#2d2d2d").pack(anchor="w", pady=(0, 5))
-        akf = tk.Frame(ec, bg="#2d2d2d")
-        akf.pack(fill="x", pady=(0, 10))
-        self.aai_entry = tk.Entry(akf, font=("Segoe UI", 10), bg="#3d3d3d",
-                                  fg="#fff", insertbackground="#fff",
-                                  relief="flat", show="*")
-        self.aai_entry.insert(0, os.getenv("ASSEMBLYAI_API_KEY", ""))
-        self.aai_entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 10))
-        self._btn(akf, "Save", self.save_assemblyai_key, "#4CAF50").pack(side="right")
-
-        # ── refinement card ──
-        ref = self._card(main, "🎯 Refinement Settings")
-        rc = tk.Frame(ref, bg="#2d2d2d")
-        rc.pack(fill="x", padx=20, pady=(0, 20))
         self.refinement_enabled = tk.BooleanVar(value=True)
-        tk.Checkbutton(
-            rc, text="Enable Groq AI refinement",
-            variable=self.refinement_enabled, command=self._on_refinement_toggle,
-            bg="#2d2d2d", fg="#fff", selectcolor="#3d3d3d",
-            activebackground="#2d2d2d", activeforeground="#fff",
-            font=("Segoe UI", 9),
-        ).pack(anchor="w", pady=2)
-        rlf = tk.Frame(rc, bg="#2d2d2d")
-        rlf.pack(fill="x", pady=(10, 0))
-        self.rate_limit_label = Label(rlf, text="", font=("Segoe UI", 8),
-                                      fg="#888", bg="#2d2d2d")
-        self.rate_limit_label.pack(side="left")
 
-        # ── log card ──
-        log = self._card(main, "📝 Activity Log")
-        lc = tk.Frame(log, bg="#2d2d2d")
-        lc.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        self.history_area = scrolledtext.ScrolledText(
-            lc, height=10, font=("Consolas", 9),
-            bg="#1a1a1a", fg="#fff", insertbackground="#fff",
-            relief="flat", wrap=tk.WORD,
+        self._build_ui()
+        self.pill = FloatingPill(
+            self.root,
+            get_level=self.capture.get_level,
+            on_stop=self.stop_recording,
+            on_cancel=self.cancel_recording,
+            on_retry=self.retry,
         )
-        self.history_area.pack(fill="both", expand=True, pady=(10, 0))
-        self.history_area.config(state="disabled")
+        self.root.withdraw()
+        self.tray = self._build_tray()
 
-        # ── footer ──
-        ft = tk.Frame(main, bg="#2d2d2d")
-        ft.pack(fill="x", pady=(20, 0))
-        Label(ft, text="🎤 Hold Ctrl+Win to Record  •  ✨ Floating Pill at Bottom Center",
-              font=("Segoe UI", 10), fg="#888", bg="#2d2d2d").pack(pady=15)
+    # ══════════════════════════════════════════════════════════════════
+    #  UI
+    # ══════════════════════════════════════════════════════════════════
 
-        # Periodic status updates
-        self._periodic_status()
+    def _build_ui(self):
+        wrap = tk.Frame(self.root, bg=theme.HEX_BG_APP)
+        wrap.pack(fill="both", expand=True, padx=24, pady=24)
 
-    # ── GUI helpers ────────────────────────────────────────────
+        Label(wrap, text="WhisprFlow", font=(theme.UI_FONT, 22, "bold"),
+              fg=theme.HEX_TEXT, bg=theme.HEX_BG_APP).pack(anchor="w")
+        Label(wrap, text="Hold Ctrl + Win to dictate anywhere",
+              font=(theme.UI_FONT, 10), fg=theme.HEX_MUTED,
+              bg=theme.HEX_BG_APP).pack(anchor="w", pady=(0, 18))
 
-    def _card(self, parent, title):
-        f = tk.Frame(parent, bg="#2d2d2d")
-        f.pack(fill="x", pady=(0, 15))
-        h = tk.Frame(f, bg="#3d3d3d")
-        h.pack(fill="x")
-        Label(h, text=title, font=("Segoe UI", 12, "bold"),
-              fg="#fff", bg="#3d3d3d").pack(anchor="w", padx=20, pady=15)
-        return f
+        # ── Engine ──
+        card = self._card(wrap, "Transcription")
+        info = self.stt.get_info()
+        self.engine_label = Label(
+            card, text=f"AssemblyAI · {info['model']}",
+            font=(theme.UI_FONT, 11, "bold"),
+            fg=theme.HEX_SUCCESS if info["configured"] else theme.HEX_WARNING,
+            bg=theme.HEX_BG_CARD)
+        self.engine_label.pack(anchor="w")
+        self.engine_sub = Label(
+            card,
+            text=("Ready" if info["configured"] else "Add an API key to start"),
+            font=(theme.UI_FONT, 9), fg=theme.HEX_MUTED, bg=theme.HEX_BG_CARD)
+        self.engine_sub.pack(anchor="w", pady=(1, 12))
 
-    def _btn(self, parent, text, cmd, color):
-        b = tk.Button(parent, text=text, command=cmd, bg=color, fg="white",
-                      font=("Segoe UI", 9, "bold"), relief="flat", padx=15, pady=8,
-                      cursor="hand2")
-        lighter = {
-            "#4CAF50": "#5CBF60", "#607D8B": "#708D9B",
-        }
-        orig = color
-        b.bind("<Enter>", lambda e: b.config(bg=lighter.get(orig, orig)))
-        b.bind("<Leave>", lambda e: b.config(bg=orig))
+        self.aai_entry = self._key_row(card, "AssemblyAI API key",
+                                       os.getenv("ASSEMBLYAI_API_KEY", ""),
+                                       self.save_assemblyai_key)
+        self.groq_entry = self._key_row(card, "Groq API key (refinement)",
+                                        os.getenv("GROQ_API_KEY", ""),
+                                        self.save_groq_key)
+
+        # ── Refinement ──
+        card2 = self._card(wrap, "Refinement")
+        tk.Checkbutton(
+            card2, text="Clean up transcripts with AI",
+            variable=self.refinement_enabled, command=self._on_refine_toggle,
+            bg=theme.HEX_BG_CARD, fg=theme.HEX_TEXT,
+            selectcolor=theme.HEX_BG_INPUT, activebackground=theme.HEX_BG_CARD,
+            activeforeground=theme.HEX_TEXT, font=(theme.UI_FONT, 10),
+            borderwidth=0, highlightthickness=0,
+        ).pack(anchor="w")
+        self.refine_status = Label(card2, text="", font=(theme.UI_FONT, 9),
+                                   fg=theme.HEX_MUTED, bg=theme.HEX_BG_CARD)
+        self.refine_status.pack(anchor="w", pady=(4, 0))
+
+        # ── Dictionary ──
+        card3 = self._card(wrap, "Dictionary")
+        self.dict_label = Label(
+            card3, text=f"{len(self.dictionary)} terms",
+            font=(theme.UI_FONT, 10), fg=theme.HEX_TEXT, bg=theme.HEX_BG_CARD)
+        self.dict_label.pack(anchor="w")
+        Label(card3, text="Names and jargon the recogniser should never guess at.",
+              font=(theme.UI_FONT, 9), fg=theme.HEX_MUTED,
+              bg=theme.HEX_BG_CARD).pack(anchor="w", pady=(1, 8))
+
+        row = tk.Frame(card3, bg=theme.HEX_BG_CARD)
+        row.pack(fill="x")
+        self.dict_entry = self._entry(row)
+        self.dict_entry.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
+        self.dict_entry.bind("<Return>", lambda e: self.add_dictionary_term())
+        self._button(row, "Add", self.add_dictionary_term).pack(side="left", padx=(0, 6))
+        self._button(row, "Open file", self.open_dictionary,
+                     subtle=True).pack(side="left")
+
+        # ── Activity ──
+        card4 = self._card(wrap, "Activity", expand=True)
+        self.log_area = scrolledtext.ScrolledText(
+            card4, height=9, font=(theme.MONO_FONT, 9),
+            bg=theme.HEX_BG_APP, fg=theme.HEX_TEXT, relief="flat",
+            wrap=tk.WORD, borderwidth=0, insertbackground=theme.HEX_TEXT)
+        self.log_area.pack(fill="both", expand=True)
+        self.log_area.tag_configure("error", foreground=theme.HEX_DANGER)
+        self.log_area.tag_configure("warn", foreground=theme.HEX_WARNING)
+        self.log_area.tag_configure("ok", foreground=theme.HEX_SUCCESS)
+        self.log_area.tag_configure("dim", foreground=theme.HEX_FAINT)
+        self.log_area.config(state="disabled")
+
+        self._refresh_status()
+
+    def _card(self, parent, title, expand=False):
+        Label(parent, text=title.upper(), font=(theme.UI_FONT, 8, "bold"),
+              fg=theme.HEX_FAINT, bg=theme.HEX_BG_APP).pack(anchor="w", pady=(8, 5))
+        frame = tk.Frame(parent, bg=theme.HEX_BG_CARD)
+        frame.pack(fill="both" if expand else "x", expand=expand, pady=(0, 6))
+        inner = tk.Frame(frame, bg=theme.HEX_BG_CARD)
+        inner.pack(fill="both", expand=True, padx=16, pady=14)
+        return inner
+
+    def _entry(self, parent, show=None):
+        return tk.Entry(
+            parent, font=(theme.UI_FONT, 10), bg=theme.HEX_BG_INPUT,
+            fg=theme.HEX_TEXT, insertbackground=theme.HEX_TEXT,
+            relief="flat", show=show, borderwidth=0, highlightthickness=0)
+
+    def _key_row(self, parent, label, value, command):
+        Label(parent, text=label, font=(theme.UI_FONT, 9),
+              fg=theme.HEX_MUTED, bg=theme.HEX_BG_CARD).pack(anchor="w", pady=(6, 3))
+        row = tk.Frame(parent, bg=theme.HEX_BG_CARD)
+        row.pack(fill="x")
+        entry = self._entry(row, show="\u2022")
+        entry.insert(0, value)
+        entry.pack(side="left", fill="x", expand=True, ipady=6, padx=(0, 8))
+        self._button(row, "Save", command).pack(side="left")
+        return entry
+
+    def _button(self, parent, text, command, subtle=False):
+        bg = theme.HEX_BG_INPUT if subtle else theme.HEX_ACCENT
+        fg = theme.HEX_TEXT if subtle else "#0d1220"
+        b = tk.Button(parent, text=text, command=command, bg=bg, fg=fg,
+                      font=(theme.UI_FONT, 9, "bold"), relief="flat",
+                      padx=14, pady=6, cursor="hand2",
+                      activebackground=theme.HEX_BG_HOVER,
+                      activeforeground=theme.HEX_TEXT,
+                      borderwidth=0, highlightthickness=0)
+        hover = theme.HEX_BG_HOVER if subtle else "#93b4ff"
+        b.bind("<Enter>", lambda e: b.config(bg=hover))
+        b.bind("<Leave>", lambda e: b.config(bg=bg))
         return b
 
-    def _periodic_status(self):
-        try:
-            self._update_refiner_label()
-        except Exception:
-            pass
-        self.root.after(5000, self._periodic_status)
+    def _build_tray(self):
+        img = Image.new("RGB", (64, 64), theme.BG_APP)
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([14, 26, 50, 38], radius=6, fill=theme.ACCENT)
+        menu = pystray.Menu(
+            pystray.MenuItem("Open WhisprFlow", self.show_window, default=True),
+            pystray.MenuItem("Dictionary", lambda: self.open_dictionary()),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self.quit_app),
+        )
+        return pystray.Icon("WhisprFlow", img, "WhisprFlow", menu)
 
-    def _update_refiner_label(self):
-        if not self.refinement_enabled.get():
-            self.rate_limit_label.config(text="Refinement off — raw transcript", fg="#FF9800")
-            return
-        if not self.refiner.is_configured:
-            self.rate_limit_label.config(text="No Groq key — raw transcript", fg="#FF9800")
-            return
-        st = self.refiner.get_stats()
-        if st["rejections"]:
-            self.rate_limit_label.config(
-                text=f"Guard blocked {st['rejections']}/{st['calls']} rewrites", fg="#FF9800")
-        else:
-            self.rate_limit_label.config(text=f"Refiner ready ({st['model']})", fg="#4CAF50")
+    # ══════════════════════════════════════════════════════════════════
+    #  Settings
+    # ══════════════════════════════════════════════════════════════════
 
-    def _on_refinement_toggle(self):
-        if self.refinement_enabled.get():
-            self.log_message("Refinement enabled")
-        else:
-            self.log_message("Refinement disabled — raw transcript only")
-        self._update_refiner_label()
-
-    # ── logging ────────────────────────────────────────────────
-
-    def log_message(self, message, is_error=False):
-        self.root.after(0, self._log, message, is_error)
-
-    def _log(self, message, is_error):
-        ts = datetime.now().strftime("%H:%M:%S")
-        tag = "error" if is_error else "normal"
-        self.history_area.config(state="normal")
-        self.history_area.tag_configure("error", foreground="#FF5252")
-        self.history_area.tag_configure("normal", foreground="#ffffff")
-        self.history_area.insert(tk.END, f"[{ts}] {message}\n", tag)
-        self.history_area.see(tk.END)
-        self.history_area.config(state="disabled")
-
-    # ── settings ───────────────────────────────────────────────
-
-    def save_settings(self):
-        key = self.api_entry.get().strip()
-        if not key:
-            messagebox.showwarning("Warning", "Enter an API key.")
-            return
-        if not self.env_path.exists():
-            self.env_path.touch()
-        set_key(str(self.env_path), "GROQ_API_KEY", key)
-        os.environ["GROQ_API_KEY"] = key
-        self.refiner.set_api_key(key)
-        self.log_message("Groq API key saved.")
-        self._update_refiner_label()
+    def _persist(self, key: str, value: str) -> None:
+        ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not ENV_PATH.exists():
+            ENV_PATH.touch()
+        set_key(str(ENV_PATH), key, value)
+        os.environ[key] = value
 
     def save_assemblyai_key(self):
         key = self.aai_entry.get().strip()
         if not key:
-            messagebox.showwarning("Warning", "Enter an AssemblyAI API key.")
+            messagebox.showwarning("WhisprFlow", "Enter an AssemblyAI API key.")
             return
-        if not self.env_path.exists():
-            self.env_path.touch()
-        set_key(str(self.env_path), "ASSEMBLYAI_API_KEY", key)
-        os.environ["ASSEMBLYAI_API_KEY"] = key
+        self._persist("ASSEMBLYAI_API_KEY", key)
         self.stt.set_api_key(key)
-        self.log_message("AssemblyAI key saved — cloud transcription enabled.")
+        self.log("AssemblyAI key saved.", "ok")
+        self._refresh_status()
         asyncio.run_coroutine_threadsafe(self.stt.warmup(), self.loop)
 
-    def _warm_connection(self):
+    def save_groq_key(self):
+        key = self.groq_entry.get().strip()
+        if not key:
+            messagebox.showwarning("WhisprFlow", "Enter a Groq API key.")
+            return
+        self._persist("GROQ_API_KEY", key)
+        self.refiner.set_api_key(key)
+        self.log("Groq key saved.", "ok")
+        self._refresh_status()
+
+    def add_dictionary_term(self):
+        term = self.dict_entry.get().strip()
+        if not term:
+            return
+        if self.dictionary.add(term):
+            self.log(f"Added \u201c{term}\u201d to dictionary.", "ok")
+            self.dict_entry.delete(0, tk.END)
+            self._refresh_status()
+        else:
+            self.log(f"\u201c{term}\u201d not added (duplicate or too long).", "warn")
+
+    def open_dictionary(self):
         try:
-            asyncio.run_coroutine_threadsafe(self.stt.warmup(), self.loop)
-        except Exception:
-            pass
+            os.startfile(str(self.dictionary.path))
+        except Exception as e:
+            self.log(f"Could not open dictionary: {e}", "error")
 
-    # ── window / tray ──────────────────────────────────────────
+    def _on_refine_toggle(self):
+        self.log("Refinement " + ("enabled." if self.refinement_enabled.get()
+                                   else "disabled — raw transcript only."))
+        self._refresh_status()
 
-    def hide_window(self):
-        self.root.withdraw()
+    def _refresh_status(self):
+        info = self.stt.get_info()
+        self.engine_label.config(
+            text=f"AssemblyAI · {info['model']}",
+            fg=theme.HEX_SUCCESS if info["configured"] else theme.HEX_WARNING)
+        self.engine_sub.config(
+            text="Ready" if info["configured"] else "Add an API key to start")
 
-    def show_window(self, icon=None, item=None):
-        self.root.after(0, self.root.deiconify)
+        if not self.refinement_enabled.get():
+            txt, col = "Off — raw transcript", theme.HEX_MUTED
+        elif not self.refiner.is_configured:
+            txt, col = "No Groq key — basic cleanup only", theme.HEX_WARNING
+        else:
+            st = self.refiner.get_stats()
+            if st["rejections"]:
+                txt = f"{st['model']} · guard blocked {st['rejections']}/{st['calls']}"
+                col = theme.HEX_WARNING
+            else:
+                txt, col = f"{st['model']} · guarded", theme.HEX_SUCCESS
+        self.refine_status.config(text=txt, fg=col)
+        self.dict_label.config(text=f"{len(self.dictionary)} terms")
 
-    def _create_tray_icon(self):
-        img = Image.new("RGB", (64, 64), (20, 20, 20))
-        ImageDraw.Draw(img).ellipse([10, 10, 54, 54], fill=(255, 60, 60))
-        menu = pystray.Menu(
-            pystray.MenuItem("Transcription History", self.show_window, default=True),
-            pystray.MenuItem("Exit", self.quit_app),
-        )
-        return pystray.Icon("WhisprFlow", img, "WhisprFlow", menu)
+    # ══════════════════════════════════════════════════════════════════
+    #  Logging
+    # ══════════════════════════════════════════════════════════════════
 
-    def quit_app(self, icon=None, item=None):
-        # ── CHANGED: graceful shutdown ──
-        if self.icon:
-            self.icon.stop()
-        # Close persistent HTTP client
+    def log(self, message: str, tag: str = "dim"):
         try:
-            asyncio.run_coroutine_threadsafe(self.refiner.close(), self.loop).result(timeout=5)
-            asyncio.run_coroutine_threadsafe(self.stt.close(), self.loop).result(timeout=5)
+            self.root.after(0, self._log_ui, message, tag)
         except Exception:
-            pass
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.root.quit()
-        os._exit(0)
+            logger.info(message)
 
-    # ══════════════════════════════════════════════════════════
-    #  Recording sequences
-    # ══════════════════════════════════════════════════════════
+    def _log_ui(self, message: str, tag: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_area.config(state="normal")
+        self.log_area.insert(tk.END, f"{ts}  ", "dim")
+        self.log_area.insert(tk.END, f"{message}\n", tag)
+        # Keep the buffer bounded; transcripts are sensitive and unbounded
+        # growth was a slow leak in the old version.
+        if int(self.log_area.index("end-1c").split(".")[0]) > 300:
+            self.log_area.delete("1.0", "100.0")
+        self.log_area.see(tk.END)
+        self.log_area.config(state="disabled")
 
-    def start_recording_sequence(self):
+    # ══════════════════════════════════════════════════════════════════
+    #  Recording
+    # ══════════════════════════════════════════════════════════════════
+
+    def start_recording(self):
         with self._state_lock:
             if self.is_recording:
                 return
+            if not self.capture.is_running:
+                self.log("Microphone unavailable.", "error")
+                self.pill.flash_error("No microphone")
+                return
             self.is_recording = True
-            self.is_cancelled = False
-            self.last_transcription_failed = False
+            self.generation += 1
 
-        winsound.Beep(1000, 100)
-        self.log_message("🎤 Recording...")
-        self.start_time = time.time()
-        self.recorder.start()
+        self._start_time = time.monotonic()
+        self.capture.begin()
+        beep_async(880, 60)
+        self.pill.set_state(PillState.RECORDING)
 
-    def stop_recording_sequence(self):
+    def stop_recording(self):
         with self._state_lock:
             if not self.is_recording:
                 return
             self.is_recording = False
+            gen = self.generation
 
-        self.recording_duration = time.time() - self.start_time
-        winsound.Beep(800, 100)
-        self.log_message("⚙️ Processing...")
+        beep_async(660, 60)
+        audio = self.capture.end()
+        duration = time.monotonic() - self._start_time
 
-        # ── CHANGED: get numpy array directly ──
-        result = self.recorder.stop()
-        if result is None:
-            self.log_message("No speech detected.", is_error=True)
+        if audio is None or duration < 0.25:
+            self.pill.set_state(PillState.IDLE)
+            self.log("Too short.", "warn")
             return
 
-        audio_data, sample_rate = result
-        self.last_audio_data = (audio_data, sample_rate)
-        asyncio.run_coroutine_threadsafe(
-            self._process_audio(audio_data, sample_rate), self.loop
-        )
+        self.pill.set_state(PillState.PROCESSING)
+        asyncio.run_coroutine_threadsafe(self._pipeline(audio, gen), self.loop)
 
-    def cancel_recording_sequence(self):
+    def cancel_recording(self):
         with self._state_lock:
             if not self.is_recording:
                 return
             self.is_recording = False
-            self.is_cancelled = True
+            self.generation += 1     # invalidates any in-flight pipeline
 
-        winsound.Beep(400, 200)
-        self.log_message("Cancelled.")
-        self.recorder.stop()  # Discard the data
+        self.capture.discard()
+        beep_async(440, 90)
+        self.pill.set_state(PillState.IDLE)
+        self.log("Cancelled.", "dim")
 
-    # ══════════════════════════════════════════════════════════
-    #  Core pipeline  — numpy in, text out
-    # ══════════════════════════════════════════════════════════
+    def _stale(self, gen: int) -> bool:
+        """True if the user cancelled or started a new take since `gen`."""
+        with self._state_lock:
+            return gen != self.generation
 
-    async def _process_audio(self, samples, sample_rate):
-        if self.is_cancelled:
-            return
+    # ══════════════════════════════════════════════════════════════════
+    #  Pipeline
+    # ══════════════════════════════════════════════════════════════════
+
+    async def _pipeline(self, audio, gen: int):
         try:
-            # ── Step 1: transcription ──
-            self.log_message("Transcribing...")
-            result = await self.stt.transcribe(
-                samples, sample_rate, keyterms=self.dictionary.as_keyterms()
-            )
-            self.last_stt_result = result
-
-            # Cancelled while the request was in flight? Do not inject into
-            # whatever window the user has moved on to.
-            if self.is_cancelled:
+            cleaned = await asyncio.to_thread(process_audio, audio, self.capture.sample_rate)
+            if self._stale(gen):
                 return
 
-            # A failure and genuine silence are different things and must
-            # produce different UI. Only a failure is worth retrying.
+            if not cleaned.speech_detected:
+                self.log("No speech detected.", "warn")
+                self.pill.set_state(PillState.IDLE)
+                return
+
+            self.last_audio = (cleaned.samples, cleaned.sample_rate)
+
+            result = await self.stt.transcribe(
+                cleaned.samples, cleaned.sample_rate,
+                keyterms=self.dictionary.as_keyterms(),
+            )
+            if self._stale(gen):
+                return
+
             if not result.ok:
-                self.log_message(f"Transcription failed: {result.error}", is_error=True)
-                self.last_transcription_failed = True
+                self.last_failed = True
+                self.log(f"Transcription failed: {result.error}", "error")
+                self.pill.flash_error(_short_error(result.error))
                 return
 
             raw = result.text
             self.last_raw_text = raw
 
             if not raw.strip():
-                self.log_message("No speech detected.")
-                self.last_transcription_failed = False
+                self.log("No speech detected.", "warn")
+                self.pill.set_state(PillState.IDLE)
                 return
 
             if DEBUG:
-                self.log_message(
-                    f"[RAW] ({result.model}, {result.latency_ms}ms, "
-                    f"conf={result.confidence:.2f}) {raw}"
-                )
+                self.log(f"[raw {result.latency_ms}ms conf={result.confidence:.2f}] {raw}")
 
-            # ── Step 2: refinement, guarded ──
-            if self.refinement_enabled.get() and self.refiner.is_configured:
-                uncertain = [w.text for w in result.low_confidence_words()]
-                final = await self.refiner.refine(
-                    raw,
-                    uncertain_words=uncertain,
-                    dictionary_terms=self.dictionary.as_keyterms(),
-                )
-                if self.refiner.last_rejected:
-                    # The rewrite looked like a hallucination and was
-                    # discarded. The raw transcript is used instead.
-                    self.log_message(
-                        f"Refinement rejected ({self.refiner.last_rejected}) — using raw text."
-                    )
-                self._update_refiner_label_safe()
-            else:
-                final = basic_cleanup(raw)
-
-            if self.is_cancelled:
+            final = await self._refine(raw, result)
+            if self._stale(gen):
                 return
 
-            # ── Step 3: inject ──
-            self.log_message(f"\u2713 {final[:60]}{'\u2026' if len(final) > 60 else ''}")
             self.last_text_injected = final
             await asyncio.to_thread(self.injector.inject, final)
-            self.overlay.trigger_success()
-            self.last_transcription_failed = False
+
+            self.last_failed = False
+            self.log(_preview(final), "ok")
+            self.pill.flash_success(_preview(final, 22))
 
         except Exception as e:
-            self.last_transcription_failed = True
-            self.log_message(f"FAILED: {e}", is_error=True)
+            self.last_failed = True
+            self.log(f"Failed: {e}", "error")
+            self.pill.flash_error("Something went wrong")
             if DEBUG:
                 traceback.print_exc()
 
-    def _update_refiner_label_safe(self):
-        try:
-            self.root.after(0, self._update_refiner_label)
-        except Exception:
-            pass
+    async def _refine(self, raw: str, result) -> str:
+        if not (self.refinement_enabled.get() and self.refiner.is_configured):
+            return basic_cleanup(raw)
 
-    # ── retry ──────────────────────────────────────────────────
+        final = await self.refiner.refine(
+            raw,
+            uncertain_words=[w.text for w in result.low_confidence_words()],
+            dictionary_terms=self.dictionary.as_keyterms(),
+        )
+        if self.refiner.last_rejected:
+            self.log(f"Refinement rejected ({self.refiner.last_rejected}) — kept raw text.",
+                     "warn")
+        self.root.after(0, self._refresh_status)
+        return final
 
-    def retry_processing_sequence(self):
-        if self.last_audio_data is not None:
-            self.log_message("Retrying from cached audio...")
-            self.last_transcription_failed = False
-            samples, sr = self.last_audio_data
-            asyncio.run_coroutine_threadsafe(self._process_audio(samples, sr), self.loop)
-        elif self.last_raw_text:
-            self.log_message("Retrying refinement only...")
-            self.last_transcription_failed = False
-            asyncio.run_coroutine_threadsafe(self._retry_refinement(), self.loop)
-        else:
-            self.last_transcription_failed = False
-            self.log_message("Nothing to retry.")
-
-    async def _retry_refinement(self):
-        try:
-            final = await self.refiner.refine(
-                self.last_raw_text,
-                dictionary_terms=self.dictionary.as_keyterms(),
-            )
-            if self.is_cancelled:
-                return
-            self.log_message(f"\u2713 (retry) {final[:60]}")
-            self.last_text_injected = final
-            await asyncio.to_thread(self.injector.inject, final)
-            self.overlay.trigger_success()
-            self.last_transcription_failed = False
-        except Exception as e:
-            self.last_transcription_failed = True
-            self.log_message(f"Retry failed: {e}", is_error=True)
-
-    # ── undo ───────────────────────────────────────────────────
-
-    def undo_injection(self):
-        if not self.last_text_injected:
-            self.log_message("Nothing to undo.")
+    def retry(self):
+        if self.last_audio is None:
+            self.log("Nothing to retry.", "dim")
             return
-        n = len(self.last_text_injected)
-        self.log_message(f"Undoing ({n} chars)...")
-        for _ in range(n):
-            self.kb_controller.press(keyboard.Key.backspace)
-            self.kb_controller.release(keyboard.Key.backspace)
-        self.last_text_injected = ""
+        with self._state_lock:
+            self.generation += 1
+            gen = self.generation
+        samples, sr = self.last_audio
+        self.pill.set_state(PillState.PROCESSING)
+        self.log("Retrying\u2026")
+        asyncio.run_coroutine_threadsafe(self._retry_from(samples, sr, gen), self.loop)
 
-    # ── keyboard listener ──────────────────────────────────────
+    async def _retry_from(self, samples, sr, gen):
+        result = await self.stt.transcribe(
+            samples, sr, keyterms=self.dictionary.as_keyterms())
+        if self._stale(gen):
+            return
+        if not result.ok:
+            self.log(f"Retry failed: {result.error}", "error")
+            self.pill.flash_error(_short_error(result.error))
+            return
+        final = await self._refine(result.text, result)
+        if self._stale(gen):
+            return
+        self.last_text_injected = final
+        await asyncio.to_thread(self.injector.inject, final)
+        self.log(_preview(final), "ok")
+        self.pill.flash_success(_preview(final, 22))
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Hotkeys
+    # ══════════════════════════════════════════════════════════════════
 
     def on_press(self, key):
         self.pressed_keys.add(key)
-        if self.hotkey_combo.issubset(self.pressed_keys) and not self.is_recording:
-            self.start_recording_sequence()
+        # Exact match only. `issubset` meant Ctrl+Win+D (new desktop) and
+        # Ctrl+Win+arrows all started phantom recordings.
+        if self.pressed_keys == self.hotkey_combo and not self.is_recording:
+            self.start_recording()
 
     def on_release(self, key):
+        was_hotkey = key in self.hotkey_combo
         self.pressed_keys.discard(key)
-        if key in self.hotkey_combo and self.is_recording:
-            self.stop_recording_sequence()
+        if was_hotkey and self.is_recording:
+            self.stop_recording()
 
-    # ══════════════════════════════════════════════════════════
-    #  Run
-    # ══════════════════════════════════════════════════════════
+    def undo(self):
+        """Ctrl+Z is safer than replaying N backspaces: most apps coalesce a
+        paste into one undo step, and blind backspaces eat real text when
+        the caret has moved."""
+        if not self.last_text_injected:
+            self.log("Nothing to undo.", "dim")
+            return
+        self.kb_controller.press(keyboard.Key.ctrl)
+        self.kb_controller.press("z")
+        self.kb_controller.release("z")
+        self.kb_controller.release(keyboard.Key.ctrl)
+        self.last_text_injected = ""
+        self.log("Undo sent.", "dim")
+
+    # ══════════════════════════════════════════════════════════════════
+    #  Window / lifecycle
+    # ══════════════════════════════════════════════════════════════════
+
+    def hide_window(self):
+        self.root.withdraw()
+
+    def show_window(self, icon=None, item=None):
+        self.root.after(0, lambda: (self.root.deiconify(), self.root.lift()))
+
+    def quit_app(self, icon=None, item=None):
+        self.log("Shutting down\u2026")
+        try:
+            self.tray.stop()
+        except Exception:
+            pass
+        self.capture.stop_stream()
+        for coro in (self.stt.close(), self.refiner.close()):
+            try:
+                asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=3)
+            except Exception:
+                pass
+        try:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        except Exception:
+            pass
+        try:
+            self.pill.destroy()
+            self.root.quit()
+        except Exception:
+            pass
+        os._exit(0)
 
     def run(self):
-        # Background async loop
         threading.Thread(
             target=lambda: (asyncio.set_event_loop(self.loop), self.loop.run_forever()),
-            daemon=True,
-        ).start()
+            daemon=True, name="asyncio").start()
 
-        # Open the TLS connection ahead of the first dictation (~200ms saved)
+        if self.capture.start_stream():
+            self.log("Microphone ready.", "ok")
+        else:
+            self.log(f"Microphone failed: {self.capture.last_error}", "error")
+
         asyncio.run_coroutine_threadsafe(self.stt.warmup(), self.loop)
 
-        # Keyboard listeners
         keyboard.Listener(on_press=self.on_press, on_release=self.on_release).start()
-        keyboard.GlobalHotKeys({self.undo_hotkey: self.undo_injection}).start()
+        keyboard.GlobalHotKeys({"<ctrl>+<alt>+z": self.undo}).start()
+        threading.Thread(target=self.tray.run, daemon=True, name="tray").start()
 
-        # System tray
-        threading.Thread(target=self.icon.run, daemon=True).start()
+        if not self.stt.is_configured:
+            self.log("No AssemblyAI key — open settings to add one.", "warn")
+            self.root.after(400, self.show_window)
+        else:
+            self.log("Ready. Hold Ctrl + Win to dictate.", "ok")
 
-        # Tkinter main loop (blocks)
         self.root.mainloop()
+
+
+def _preview(text: str, limit: int = 60) -> str:
+    text = (text or "").strip().replace("\n", " ")
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
+
+
+def _short_error(error: str) -> str:
+    e = (error or "").lower()
+    if "key" in e or "401" in e or "unauthor" in e:
+        return "Check API key"
+    if "timed out" in e or "timeout" in e:
+        return "Timed out"
+    if "network" in e or "connect" in e:
+        return "No connection"
+    if "insufficient" in e or "credit" in e:
+        return "Out of credit"
+    return "Failed \u21ba"
 
 
 if __name__ == "__main__":

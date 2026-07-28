@@ -28,8 +28,11 @@ Hold **Ctrl + Win**, speak, release. Text is injected at the cursor.
 ## How it works
 
 ```
-hotkey → record → AssemblyAI → Groq cleanup → guard → paste
+always-on mic (500 ms pre-roll) → VAD → AssemblyAI → Groq → guard → paste
 ```
+
+The mic is open before you press the key, so the first syllable is never
+lost. Every LLM rewrite is checked before injection.
 
 The guard rejects any rewrite that flips a negation, changes a number, or
 drops a dictionary term — the raw transcript is used instead. See
@@ -37,11 +40,11 @@ drops a dictionary term — the raw transcript is used instead. See
 
 | Stage | Component |
 |---|---|
-| Capture | `sounddevice` → `recorder.py` |
+| Capture | Always-on 16 kHz stream + pre-roll ring (`audio/`) |
 | Transcription | **AssemblyAI Universal-3.5 Pro** + keyterms |
 | Dictionary | `%APPDATA%\WhisprFlow\user_dictionary.txt` |
 | Refinement | Groq `llama-3.1-8b-instant`, output verified by a guard |
-| Injection | Clipboard paste with save/restore |
+| Injection | Direct unicode ≤120 chars, else clipboard w/ restore |
 
 Architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 
@@ -69,16 +72,18 @@ single biggest accuracy improvement available.
 
 | Key | Action |
 |---|---|
-| `Ctrl + Win` (hold) | Record |
-| `Ctrl + Alt + Z` | Undo last injection |
+| `Ctrl + Win` (hold) | Dictate |
+| `Ctrl + Alt + Z` | Undo |
+
+Click the left of the pill to cancel mid-recording, the right to stop
+early, or the pill itself after an error to retry.
 
 ---
 
 ## Development
 
 ```bash
-python -m pytest test_stt.py -v        # STT + guard (47 tests)
-python -m pytest test_recorder.py -v   # audio capture
+python -m pytest -q                    # 81 tests
 python eval/mock_api_test.py           # end-to-end HTTP flow
 python eval/run_wer.py                 # accuracy on your own clips
 ```
@@ -86,9 +91,14 @@ python eval/run_wer.py                 # accuracy on your own clips
 ### Layout
 
 ```
-main.py                   app, UI, pipeline
-recorder.py               audio capture
-injector.py               text injection
+main.py                   app, settings window, tray, pipeline
+audio/
+  capture.py              always-on stream + pre-roll ring
+  process.py              VAD, high-pass, RMS levelling
+ui/
+  overlay.py              floating pill
+  theme.py                design tokens
+injector.py               text insertion
 stt/
   base.py                 TranscriptionResult + WAV encoding
   assemblyai_client.py    transcription engine

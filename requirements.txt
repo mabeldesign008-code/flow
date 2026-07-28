@@ -1,7 +1,8 @@
 # ── Core ──────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0,<2.0.0
 pyperclip>=1.8.2,<2.0.0
-keyboard>=0.13.5,<0.14.0
+# pynput only -- running a second global hook (the `keyboard` package)
+# alongside it caused the two to intercept each other's synthetic events.
 pynput>=1.7.6,<2.0.0
 
 # httpx[http2] gives connection reuse between dictations.
@@ -10,6 +11,9 @@ pynput>=1.7.6,<2.0.0
 httpx[http2]>=0.27.0,<0.29.0
 
 # ── Audio ─────────────────────────────────────────────────────────────
+# sounddevice keeps one 16 kHz mono stream open for the app's lifetime and
+# fills a pre-roll ring buffer, so the mic is already live when the hotkey
+# fires (see audio/capture.py).
 sounddevice>=0.4.6,<0.6.0
 numpy>=1.24.0,<3.0.0
 scipy>=1.11.0,<2.0.0
