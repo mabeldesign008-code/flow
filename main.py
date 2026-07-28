@@ -20,7 +20,13 @@ from pynput.keyboard import Controller as KeyboardController
 
 from recorder import AudioRecorder
 from groq_client import GroqClient
-from sensevoice_client_optimized import OptimizedSenseVoiceClient
+from stt import (
+    AssemblyAIClient,
+    EnginePolicy,
+    EngineRouter,
+    LocalSherpaClient,
+    UserDictionary,
+)
 from injector import TextInjector
 from dotenv import load_dotenv, set_key
 
@@ -352,8 +358,21 @@ class WhisprFlowApp:
         self.env_path = Path(".env")
         self.recorder = AudioRecorder()
         self.client = GroqClient()
-        self.sensevoice = OptimizedSenseVoiceClient(model_size="small", language="en")
         self.injector = TextInjector()
+
+        # ── Transcription: AssemblyAI cloud, local sherpa-onnx as fallback ──
+        self.dictionary = UserDictionary()
+        self.stt = EngineRouter(
+            cloud=AssemblyAIClient(
+                api_key=os.getenv("ASSEMBLYAI_API_KEY", ""),
+                model=os.getenv("ASSEMBLYAI_MODEL", "universal-3-5-pro"),
+            ),
+            local=LocalSherpaClient(
+                model_type=os.getenv("LOCAL_STT_MODEL", "parakeet"),
+            ),
+            policy=EnginePolicy(os.getenv("STT_POLICY", "cloud_first")),
+            on_event=lambda msg: self.log_message(msg),
+        )
         
         # ── Screen context capture (OCR) ──
         from screen_context import ScreenContext
@@ -365,6 +384,7 @@ class WhisprFlowApp:
         self.is_cancelled = False
         self.last_transcription_failed = False
         self.last_raw_text = ""
+        self.last_stt_result = None
         self.last_audio_data = None       # (np.ndarray, sr)  for retry
         self.last_audio_path = None       # file path fallback for retry
         self.last_text_injected = ""
@@ -397,8 +417,8 @@ class WhisprFlowApp:
         self.root.withdraw()
         self.icon = self._create_tray_icon()
 
-        # ── CHANGED: preload model during startup ──
-        self.sensevoice.preload()
+        # ── Warm the local fallback model in the background ──
+        self.stt.preload()
 
         self.log_message("System ready.  Hold Ctrl+Win to record.")
         print("WhisprFlow started.")
@@ -446,10 +466,33 @@ class WhisprFlowApp:
         eng = self._card(main, "⚡ Transcription Engine")
         ec = tk.Frame(eng, bg="#2d2d2d")
         ec.pack(fill="x", padx=20, pady=(0, 20))
-        Label(ec, text="Optimized SenseVoice",
-              font=("Segoe UI", 12, "bold"), fg="#4CAF50", bg="#2d2d2d").pack(anchor="w")
-        Label(ec, text="English • Multi-threaded • INT8 Quantized",
-              font=("Segoe UI", 9), fg="#888", bg="#2d2d2d").pack(anchor="w", pady=(0, 10))
+        info = self.stt.get_info()
+        cloud_ok = info["cloud"]["configured"]
+        Label(ec, text=f"AssemblyAI {info['cloud']['model']}",
+              font=("Segoe UI", 12, "bold"),
+              fg="#4CAF50" if cloud_ok else "#FF9800",
+              bg="#2d2d2d").pack(anchor="w")
+        Label(ec,
+              text=("English • Cloud • Keyterms enabled" if cloud_ok
+                    else "No API key — add one below to enable cloud accuracy"),
+              font=("Segoe UI", 9), fg="#888", bg="#2d2d2d").pack(anchor="w")
+        self.engine_status_label = Label(
+            ec, text=f"Fallback: local {info['local']['model']} • "
+                     f"Dictionary: {len(self.dictionary)} terms",
+            font=("Segoe UI", 8), fg="#666", bg="#2d2d2d")
+        self.engine_status_label.pack(anchor="w", pady=(2, 10))
+
+        # ── AssemblyAI key ──
+        Label(ec, text="AssemblyAI API Key", font=("Segoe UI", 10, "bold"),
+              fg="#fff", bg="#2d2d2d").pack(anchor="w", pady=(0, 5))
+        akf = tk.Frame(ec, bg="#2d2d2d")
+        akf.pack(fill="x", pady=(0, 10))
+        self.aai_entry = tk.Entry(akf, font=("Segoe UI", 10), bg="#3d3d3d",
+                                  fg="#fff", insertbackground="#fff",
+                                  relief="flat", show="*")
+        self.aai_entry.insert(0, os.getenv("ASSEMBLYAI_API_KEY", ""))
+        self.aai_entry.pack(side="left", fill="x", expand=True, ipady=8, padx=(0, 10))
+        self._btn(akf, "Save", self.save_assemblyai_key, "#4CAF50").pack(side="right")
 
         # ── refinement card ──
         ref = self._card(main, "🎯 Refinement Settings")
@@ -576,7 +619,20 @@ class WhisprFlowApp:
         self.client.api_key = key
         # ── CHANGED: update existing client headers ──
         self.client._client = None  # Force re-creation with new key
-        self.log_message("API key saved.")
+        self.log_message("Groq API key saved.")
+
+    def save_assemblyai_key(self):
+        key = self.aai_entry.get().strip()
+        if not key:
+            messagebox.showwarning("Warning", "Enter an AssemblyAI API key.")
+            return
+        if not self.env_path.exists():
+            self.env_path.touch()
+        set_key(str(self.env_path), "ASSEMBLYAI_API_KEY", key)
+        os.environ["ASSEMBLYAI_API_KEY"] = key
+        self.stt.cloud.set_api_key(key)
+        self.log_message("AssemblyAI key saved — cloud transcription enabled.")
+        asyncio.run_coroutine_threadsafe(self.stt.warmup(), self.loop)
 
     # ── window / tray ──────────────────────────────────────────
 
@@ -600,7 +656,11 @@ class WhisprFlowApp:
         if self.icon:
             self.icon.stop()
         # Close persistent HTTP client
-        asyncio.run_coroutine_threadsafe(self.client.close(), self.loop).result(timeout=5)
+        try:
+            asyncio.run_coroutine_threadsafe(self.client.close(), self.loop).result(timeout=5)
+            asyncio.run_coroutine_threadsafe(self.stt.close(), self.loop).result(timeout=5)
+        except Exception:
+            pass
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.root.quit()
         os._exit(0)
@@ -663,18 +723,33 @@ class WhisprFlowApp:
         if self.is_cancelled:
             return
         try:
-            # Step 1: local transcription (no file I/O)
-            self.log_message("Transcribing locally...")
-            raw = await self.sensevoice.transcribe_audio(samples, sample_rate)
-            self.last_raw_text = raw
+            # Step 1: transcription (AssemblyAI, local fallback)
+            self.log_message("Transcribing...")
+            result = await self.stt.transcribe(
+                samples, sample_rate, keyterms=self.dictionary.as_keyterms()
+            )
+            self.last_stt_result = result
 
-            if not raw or not raw.strip():
-                self.log_message("Empty transcription — nothing to inject.", is_error=True)
+            # A failure and genuine silence are different things and must
+            # produce different UI. Only a failure is worth retrying.
+            if not result.ok:
+                self.log_message(f"Transcription failed: {result.error}", is_error=True)
                 self.last_transcription_failed = True
                 return
 
+            raw = result.text
+            self.last_raw_text = raw
+
+            if not raw.strip():
+                self.log_message("No speech detected.")
+                self.last_transcription_failed = False
+                return
+
             if DEBUG:
-                self.log_message(f"[RAW] {raw}")
+                self.log_message(
+                    f"[RAW] ({result.engine}/{result.model}, "
+                    f"{result.latency_ms}ms, conf={result.confidence:.2f}) {raw}"
+                )
 
             # Step 2: refinement
             if self.refinement_enabled.get():
@@ -781,6 +856,9 @@ class WhisprFlowApp:
             target=lambda: (asyncio.set_event_loop(self.loop), self.loop.run_forever()),
             daemon=True,
         ).start()
+
+        # Open the TLS connection ahead of the first dictation (~200ms saved)
+        asyncio.run_coroutine_threadsafe(self.stt.warmup(), self.loop)
 
         # Keyboard listeners
         keyboard.Listener(on_press=self.on_press, on_release=self.on_release).start()

@@ -60,3 +60,14 @@ tmp/
 
 # Serena
 .serena/cache/
+
+# Local model files
+models/*
+!models/*/
+!models/**/tokens.txt
+*.onnx
+
+# Eval data (your own recordings + transcripts)
+eval/clips/
+eval/reference.jsonl
+eval/results*.json

@@ -1,26 +1,39 @@
-# Core dependencies
-python-dotenv
-pyperclip
-keyboard
-pynput
-httpx[http2]
+# ── Core ──────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0,<2.0.0
+pyperclip>=1.8.2,<2.0.0
+keyboard>=0.13.5,<0.14.0
+pynput>=1.7.6,<2.0.0
 
-# Audio processing
-sounddevice
-numpy
-scipy
+# httpx[http2] gives connection reuse between dictations.
+# The h2 extra is optional at runtime -- the client detects it and falls
+# back to HTTP/1.1 rather than crashing (see stt/assemblyai_client.py).
+httpx[http2]>=0.27.0,<0.29.0
 
-# Speech recognition
-sherpa-onnx
+# ── Audio ─────────────────────────────────────────────────────────────
+sounddevice>=0.4.6,<0.6.0
+numpy>=1.24.0,<3.0.0
+scipy>=1.11.0,<2.0.0
 
-# GUI
-Pillow
-pystray
+# ── Speech recognition ────────────────────────────────────────────────
+# Cloud (primary): AssemblyAI over plain HTTP via httpx -- no SDK needed.
+# Local (fallback): sherpa-onnx running Parakeet TDT or SenseVoice.
+sherpa-onnx>=1.10.0,<2.0.0
 
-# Screen Context - OCR (choose one)
-# PaddleOCR (fastest, recommended)
-paddlepaddle
-paddleocr
+# ── GUI ───────────────────────────────────────────────────────────────
+Pillow>=10.1.0,<12.0.0
+pystray>=0.19.4,<0.20.0
 
-# OR EasyOCR (slower fallback)
-# easyocr
+# ── Windows integration (shortcut creation) ───────────────────────────
+pywin32>=306; sys_platform == "win32"
+winshell>=0.6; sys_platform == "win32"
+
+# ── Screen context OCR (optional) ─────────────────────────────────────
+# PaddleOCR 3.x removed show_log/use_gpu kwargs and changed .ocr(); the
+# code targets the 2.7-2.9 API, so it is pinned. Being replaced by UI
+# Automation -- see AUDIT.md section 3.4.
+# paddlepaddle>=2.5.0,<3.0.0
+# paddleocr>=2.7.0,<3.0.0
+
+# ── Dev / test ────────────────────────────────────────────────────────
+pytest>=7.4.0,<9.0.0
+pytest-asyncio>=0.21.0,<0.25.0
