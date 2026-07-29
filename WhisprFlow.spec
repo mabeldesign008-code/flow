@@ -2,69 +2,111 @@
 """
 PyInstaller spec for WhisprFlow.
 
-Built on a real Windows runner by .github/workflows/release.yml -- these
-are onefile, windowed (no console), and self-contained: the user needs no
-Python install.
+Built on a real Windows runner by .github/workflows/release.yml -- onefile,
+windowed, self-contained: the user needs no Python install.
 
-The original spec had datas=[] and hiddenimports=[], so the EXE shipped
-without its assets and crashed on pystray/PIL backends that PyInstaller's
-static analysis cannot see.
+Two bugs that shipped a broken v1.0.0 EXE, both fixed here:
+
+1. "Importing the numpy C-extensions failed."
+   numpy's compiled extensions (_multiarray_umath) link against DLLs that
+   pip vendors into a sibling `numpy.libs` directory. PyInstaller does not
+   always pick those up on its own, so the .pyd loaded and then failed to
+   resolve its imports at runtime. collect_all("numpy") gathers the
+   package, its binaries and that libs directory together.
+
+2. Excluding "setuptools" broke numpy.
+   numpy imports pkg_resources/setuptools internally during initialisation.
+   Excluding it to save space removed a real dependency. Same story for the
+   blanket scipy.* excludes: scipy.signal pulls in scipy.sparse and friends
+   transitively, so pruning them by name produced a scipy that imports and
+   then dies on first use.
+
+The rule learned: exclude only leaf packages nothing imports, never
+anything a shipped dependency might reach.
 """
 
-import sys
-from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_all,
+    collect_dynamic_libs,
+    collect_submodules,
+)
 
-# sounddevice ships the PortAudio DLL as package data; without this the
-# EXE builds fine and then fails at runtime with "PortAudio library not
-# found" the first time you press the hotkey.
-binaries = collect_dynamic_libs("sounddevice")
+# --- numpy: package + compiled extensions + vendored DLLs -----------------
+numpy_datas, numpy_binaries, numpy_hidden = collect_all("numpy")
 
-hiddenimports = [
-    # pystray and PIL pick a backend at runtime via importlib, which
-    # PyInstaller's static analysis cannot follow.
-    "pystray._win32",
-    "PIL._tkinter_finder",
-    # pynput likewise selects a platform backend dynamically.
-    "pynput.keyboard._win32",
-    "pynput.mouse._win32",
-    "sounddevice",
-    "_sounddevice_data",
-    "scipy.signal",
-    "scipy.special._cdflib",
-    # HTTP/2 and WebSocket transports are imported lazily.
-    "h2",
-    "hpack",
-    "hyperframe",
-    "websockets",
-    "websockets.legacy",
-    "websockets.legacy.client",
-    # Optional context providers -- guarded at import, but bundle them so
-    # the feature works out of the box.
-    "psutil",
-    "uiautomation",
-    "comtypes",
-    "comtypes.stream",
-]
+# --- scipy: only signal is used, but let PyInstaller's hooks resolve its
+#     real dependency graph rather than guessing at it by name.
+scipy_datas, scipy_binaries, scipy_hidden = collect_all("scipy.signal")
+
+# sounddevice ships the PortAudio DLL as package data; without this the EXE
+# builds fine and then fails at runtime the first time the mic is opened.
+sd_binaries = collect_dynamic_libs("sounddevice")
+
+binaries = numpy_binaries + scipy_binaries + sd_binaries
+datas = (
+    numpy_datas
+    + scipy_datas
+    + [
+        ("assets/icon.ico", "assets"),
+        ("assets/icon.png", "assets"),
+    ]
+)
+
+hiddenimports = (
+    numpy_hidden
+    + scipy_hidden
+    + [
+        # pystray and PIL choose a backend at runtime via importlib, which
+        # PyInstaller's static analysis cannot follow.
+        "pystray._win32",
+        "PIL._tkinter_finder",
+        # pynput likewise selects a platform backend dynamically.
+        "pynput.keyboard._win32",
+        "pynput.mouse._win32",
+        "sounddevice",
+        "_sounddevice_data",
+        # HTTP/2 and WebSocket transports are imported lazily.
+        "h2",
+        "hpack",
+        "hyperframe",
+        "websockets",
+        "websockets.legacy",
+        "websockets.legacy.client",
+        # Optional context providers -- guarded at import, but bundled so
+        # the feature works out of the box.
+        "psutil",
+        "uiautomation",
+        "comtypes",
+        "comtypes.stream",
+    ]
+)
 hiddenimports += collect_submodules("comtypes")
 
 a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=binaries,
-    datas=[
-        ("assets/icon.ico", "assets"),
-        ("assets/icon.png", "assets"),
-    ],
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Nothing here is used; excluding them cuts ~80 MB off the binary.
-        "matplotlib", "pandas", "PyQt5", "PyQt6", "PySide2", "PySide6",
-        "pytest", "IPython", "notebook", "sphinx", "setuptools",
-        "scipy.optimize", "scipy.sparse", "scipy.interpolate",
-        "scipy.integrate", "scipy.spatial", "scipy.stats",
+        # Only true leaves. Nothing we ship imports these, directly or
+        # transitively. setuptools and scipy submodules are deliberately
+        # NOT here -- excluding them is what broke v1.0.0.
+        "matplotlib",
+        "pandas",
+        "PyQt5",
+        "PyQt6",
+        "PySide2",
+        "PySide6",
+        "pytest",
+        "IPython",
+        "notebook",
+        "sphinx",
+        "tornado",
+        "jedi",
     ],
     noarchive=False,
     optimize=0,
@@ -82,8 +124,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    # UPX corrupts some Python extension DLLs and trips antivirus
-    # heuristics. The size saving is not worth a binary that will not run.
+    # UPX corrupts some Python extension DLLs (numpy's especially) and
+    # trips antivirus heuristics. A smaller binary that will not run is
+    # not a trade worth making.
     upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,

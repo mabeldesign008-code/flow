@@ -884,9 +884,69 @@ def _short_error(error: str) -> str:
     return "Failed \u21ba"
 
 
-if __name__ == "__main__":
-    app = WhisprFlowApp()
+def _fatal(title: str, message: str) -> None:
+    """Show a readable error instead of PyInstaller's raw traceback dialog.
+
+    A frozen windowed app has no console, so an unhandled exception
+    surfaces as an unreadable wall of text. Worse, that dialog keeps the
+    process alive -- which is how a broken v1.0.0 passed its own CI check.
+    """
+    sys.stderr.write(f"{title}\n\n{message}\n")
     try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(title, message)
+        root.destroy()
+    except Exception:
+        pass
+
+
+def _check_runtime() -> None:
+    """Verify the compiled dependencies loaded before touching the UI."""
+    try:
+        import numpy as np
+        np.zeros(8, dtype=np.float32).sum()
+    except Exception as e:
+        _fatal(
+            "WhisprFlow — missing components",
+            "NumPy failed to load, so this build is incomplete.\n\n"
+            f"{type(e).__name__}: {e}\n\n"
+            "Please report this at:\n"
+            "https://github.com/mabeldesign008-code/flow/issues",
+        )
+        raise SystemExit(1)
+
+    try:
+        import sounddevice as _sd  # noqa: F401
+        _ = _sd.__name__
+    except Exception as e:
+        _fatal(
+            "WhisprFlow — audio unavailable",
+            "The audio library could not be loaded.\n\n"
+            f"{type(e).__name__}: {e}\n\n"
+            "On Windows this usually means the PortAudio DLL is missing "
+            "from the build. Please report this at:\n"
+            "https://github.com/mabeldesign008-code/flow/issues",
+        )
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    _check_runtime()
+    try:
+        app = WhisprFlowApp()
         app.run()
     except KeyboardInterrupt:
         os._exit(0)
+    except Exception as exc:
+        logger.exception("Fatal error during startup")
+        _fatal(
+            "WhisprFlow — startup failed",
+            f"{type(exc).__name__}: {exc}\n\n"
+            + "".join(traceback.format_exc().splitlines(True)[-6:])
+            + "\nPlease report this at:\n"
+            "https://github.com/mabeldesign008-code/flow/issues",
+        )
+        raise SystemExit(1)

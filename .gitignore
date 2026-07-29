@@ -78,3 +78,7 @@ build/
 dist/
 package/
 *.spec.bak
+NpOld.spec
+WhisprFlowProbe.spec
+probe/
+probe_old/

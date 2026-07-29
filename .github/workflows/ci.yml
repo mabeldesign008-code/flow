@@ -46,6 +46,16 @@ jobs:
       - name: Mock API integration
         run: python eval/mock_api_test.py
 
+      - name: Import probe (unfrozen)
+        # Same checks the packaged binary runs, so a missing dependency is
+        # caught on every push rather than at release time.
+        run: xvfb-run -a python eval/import_probe.py
+        if: runner.os == 'Linux'
+
+      - name: Import probe (Windows)
+        run: python eval/import_probe.py
+        if: runner.os == 'Windows' 
+
       - name: Boot smoke test (Linux)
         if: runner.os == 'Linux'
         run: xvfb-run -a python eval/smoke_test.py
