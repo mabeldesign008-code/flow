@@ -256,6 +256,31 @@ def main():
     _release(); _pump()
     check("keys released cleanly", not app.pressed_keys, str(app.pressed_keys))
 
+    # Command Mode must also stop on key release. It shipped broken once
+    # because start_command_mode never set _press_time, so on_release
+    # ignored the event and it recorded until the duration cap.
+    from selection import Selection
+    _real_sel = app.selection
+    app.selection = type("S", (), {
+        "capture": lambda s: Selection(text="some selected text", ok=True),
+        "replace": lambda s, t: True})()
+    app.commands.set_api_key("probe-key")
+
+    SHIFT = _kb.Key.shift
+    # Previous steps may have left keys behind; the combo is matched
+    # exactly, so start from a clean set.
+    app.pressed_keys.clear()
+    if app.is_recording:
+        app.cancel_recording(); _pump()
+    app.on_press(CTRL); app.on_press(SHIFT); app.on_press(WIN); _pump()
+    check("command mode starts", app.is_recording and app.command_mode)
+    check("command mode arms release", app._press_time > 0,
+          "on_release would ignore the keys")
+    _t.sleep(app.TAP_SECONDS + 0.15)
+    app.on_release(WIN); app.on_release(SHIFT); app.on_release(CTRL); _pump()
+    check("command mode stops on release", not app.is_recording)
+    app.selection = _real_sel
+
     print("\n=== 9. Thread safety ===")
     # Every UI call from the pipeline must be marshalled to the main
     # thread; calling Tk directly from the asyncio thread raises

@@ -712,6 +712,10 @@ class WhisprFlowApp:
 
         self._pending_selection = sel.text
         self._start_time = time.monotonic()
+        # on_release only acts when _press_time is set. Without this the
+        # keys could be released and nothing would happen -- Command Mode
+        # would record until the duration cap.
+        self._press_time = time.monotonic()
         self._partial = ""
         self.capture.begin()
         beep_async(1320, 55)
