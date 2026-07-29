@@ -91,7 +91,8 @@ early, or the pill itself after an error to retry.
 ## Development
 
 ```bash
-python -m pytest -q                    # 133 tests
+python -m pytest -q                    # 133 unit tests
+python eval/smoke_test.py              # boots the real app end-to-end
 python eval/mock_api_test.py           # end-to-end HTTP flow
 python eval/run_wer.py                 # accuracy on your own clips
 ```

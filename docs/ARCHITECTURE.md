@@ -350,3 +350,47 @@ Dismissals are permanent.
 > dictionary is falsy. `if not self.dictionary` bailed out precisely when
 > the dictionary was empty, meaning the very first learned term could never
 > be added. Now `is None`.
+
+
+---
+
+## Thread safety
+
+Tkinter is not thread-safe: every widget call must happen on the thread
+running `mainloop()`. The pipeline runs on a background asyncio thread, so
+**all** UI updates are marshalled:
+
+```python
+def _ui(self, fn, *args):
+    self.root.after(0, lambda: _safe_call(fn, *args))
+```
+
+`pill_state`, `pill_partial`, `pill_success`, `pill_error` and
+`refresh_status` are the only ways the pipeline touches the UI.
+
+Two bugs here were caught by booting the real app rather than by unit
+tests, because unit tests never construct `WhisprFlowApp`:
+
+1. The pipeline called `self.pill.flash_error(...)` directly from the
+   asyncio thread → `RuntimeError: main thread is not in main loop`, which
+   killed the dictation *after* a successful transcription.
+2. `self.refinement_enabled.get()` read a Tk `BooleanVar` off-thread. Tk
+   variables have the same restriction as widgets. It is now mirrored into
+   a plain `self._refine_on` bool that the pipeline reads.
+
+Also fixed while booting: `ImageTk.PhotoImage` was binding to the default
+Tk root instead of the pill's `Toplevel`, raising
+`image "pyimageN" doesn't exist`; and `-transparentcolor` (Windows-only)
+was unguarded.
+
+## Smoke test
+
+`eval/smoke_test.py` stubs the Windows/hardware surface, constructs the
+real `WhisprFlowApp`, and drives a complete cycle: record → transcribe →
+refine → guard → inject → shut down. It covers construction, wiring, the
+cancel path, every pill state rendering, a live-API pipeline run, and
+concurrent UI calls from four worker threads.
+
+This is the test that catches integration errors — undefined names, wrong
+call signatures between modules, thread violations — that unit tests
+structurally cannot.

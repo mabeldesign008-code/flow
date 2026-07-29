@@ -30,7 +30,7 @@ import math
 import time
 import tkinter as tk
 from enum import Enum
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
@@ -108,9 +108,16 @@ class FloatingPill:
 
         self.root = tk.Toplevel(parent_root)
         self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
         self.root.configure(bg="black")
-        self.root.attributes("-transparentcolor", "black")
+
+        # Each of these is best-effort. -transparentcolor is Windows-only,
+        # and a window manager that rejects any one of them must not stop
+        # the app from starting -- the pill just looks less polished.
+        for attr, value in (("-topmost", True), ("-transparentcolor", "black")):
+            try:
+                self.root.attributes(attr, value)
+            except Exception:
+                pass
 
         self.state = PillState.IDLE
         self._state_since = time.monotonic()
@@ -129,6 +136,7 @@ class FloatingPill:
         self._dirty = True
         self._photo = None
         self._idle_cache: Optional[ImageTk.PhotoImage] = None
+        self._idle_size = (0, 0)
         self._after_id: Optional[str] = None
 
         sw = self.root.winfo_screenwidth()
@@ -330,21 +338,28 @@ class FloatingPill:
             self._draw_dots(d, w * S, h * S, S, 1.0 - reveal)
 
         final = img.resize((w, h), Image.Resampling.LANCZOS)
-        self._photo = ImageTk.PhotoImage(final)
+        self._photo = ImageTk.PhotoImage(final, master=self.root)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
 
     def _draw_cached_idle(self, w: int, h: int) -> None:
-        if self._idle_cache is None:
+        # Cache keyed on size: the collapsed pill is identical every frame,
+        # so there is no reason to rebuild it. Rebuilt if the size changes
+        # (DPI switch, display change).
+        if self._idle_cache is None or self._idle_size != (w, h):
             S = self.SS
             img = Image.new("RGBA", (w * S, h * S), (0, 0, 0, 0))
             d = ImageDraw.Draw(img)
             d.rounded_rectangle([0, 0, w * S - 1, h * S - 1],
                                 radius=h * S // 2, fill=(*BG_PILL, 235))
             self._draw_dots(d, w * S, h * S, S, 1.0)
+            # master= is required: without it PhotoImage binds to the
+            # default Tk root rather than this Toplevel, and the canvas
+            # raises 'image "pyimageN" doesn\'t exist'.
             self._idle_cache = ImageTk.PhotoImage(
-                img.resize((w, h), Image.Resampling.LANCZOS)
+                img.resize((w, h), Image.Resampling.LANCZOS), master=self.root
             )
+            self._idle_size = (w, h)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self._idle_cache)
 

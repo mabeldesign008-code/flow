@@ -14,7 +14,6 @@ import time
 import traceback
 import winsound
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 import tkinter as tk
@@ -139,6 +138,9 @@ class WhisprFlowApp:
         self.root.configure(bg=theme.HEX_BG_APP)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
+        # Tk variables may only be touched on the main thread, so the
+        # pipeline reads this plain mirror instead of the BooleanVar.
+        self._refine_on = True
         self.refinement_enabled = tk.BooleanVar(value=True)
 
         self._build_ui()
@@ -406,6 +408,7 @@ class WhisprFlowApp:
             self.log(f"Could not open dictionary: {e}", "error")
 
     def _on_refine_toggle(self):
+        self._refine_on = bool(self.refinement_enabled.get())
         self.log("Refinement " + ("enabled." if self.refinement_enabled.get()
                                    else "disabled — raw transcript only."))
         self._refresh_status()
@@ -440,6 +443,34 @@ class WhisprFlowApp:
     #  Logging
     # ══════════════════════════════════════════════════════════════════
 
+    # ── thread-safe UI calls ──────────────────────────────────────────
+    #
+    # Tkinter is not thread-safe: every widget call must happen on the
+    # thread running mainloop(). The pipeline runs on the asyncio thread,
+    # so all pill/window updates are marshalled through root.after(0, ...).
+    # Calling directly raised "main thread is not in main loop".
+
+    def _ui(self, fn, *args):
+        try:
+            self.root.after(0, lambda: _safe_call(fn, *args))
+        except Exception:
+            pass
+
+    def pill_state(self, state, status: str = ""):
+        self._ui(self.pill.set_state, state, status)
+
+    def pill_success(self, message: str = ""):
+        self._ui(self.pill.flash_success, message)
+
+    def pill_error(self, message: str = ""):
+        self._ui(self.pill.flash_error, message)
+
+    def pill_partial(self, text: str):
+        self._ui(self.pill.set_partial, text)
+
+    def refresh_status(self):
+        self._ui(self._refresh_status)
+
     def log(self, message: str, tag: str = "dim"):
         try:
             self.root.after(0, self._log_ui, message, tag)
@@ -468,16 +499,17 @@ class WhisprFlowApp:
                 return
             if not self.capture.is_running:
                 self.log("Microphone unavailable.", "error")
-                self.pill.flash_error("No microphone")
+                self.pill_error("No microphone")
                 return
             self.is_recording = True
             self.generation += 1
+            gen = self.generation
 
         self._start_time = time.monotonic()
         self._partial = ""
         self.capture.begin()
         beep_async(880, 60)
-        self.pill.set_state(PillState.RECORDING)
+        self.pill_state(PillState.RECORDING)
 
         # Read the foreground app now, while the user speaks -- never
         # after, where it would sit on the critical path. Costs ~2-10 ms
@@ -522,7 +554,7 @@ class WhisprFlowApp:
         if not text or not self.is_recording:
             return
         self._partial = text
-        self.pill.set_partial(text)
+        self.pill_partial(text)
 
     def stop_recording(self):
         with self._state_lock:
@@ -536,11 +568,11 @@ class WhisprFlowApp:
         duration = time.monotonic() - self._start_time
 
         if audio is None or duration < 0.25:
-            self.pill.set_state(PillState.IDLE)
+            self.pill_state(PillState.IDLE)
             self.log("Too short.", "warn")
             return
 
-        self.pill.set_state(PillState.PROCESSING)
+        self.pill_state(PillState.PROCESSING)
         session, self._session = self._session, None
         asyncio.run_coroutine_threadsafe(self._pipeline(audio, gen, session), self.loop)
 
@@ -556,7 +588,7 @@ class WhisprFlowApp:
         if session is not None:
             asyncio.run_coroutine_threadsafe(session.abort(), self.loop)
         beep_async(440, 90)
-        self.pill.set_state(PillState.IDLE)
+        self.pill_state(PillState.IDLE)
         self.log("Cancelled.", "dim")
 
     def _stale(self, gen: int) -> bool:
@@ -585,7 +617,7 @@ class WhisprFlowApp:
             if not result.ok:
                 self.last_failed = True
                 self.log(f"Transcription failed: {result.error}", "error")
-                self.pill.flash_error(_short_error(result.error))
+                self.pill_error(_short_error(result.error))
                 return
 
             raw = result.text
@@ -596,7 +628,7 @@ class WhisprFlowApp:
                     self.log("No speech detected.", "warn")
                 else:
                     self.log("Nothing transcribed.", "warn")
-                self.pill.set_state(PillState.IDLE)
+                self.pill_state(PillState.IDLE)
                 return
 
             if DEBUG:
@@ -612,17 +644,17 @@ class WhisprFlowApp:
 
             self.last_failed = False
             self.log(_preview(final), "ok")
-            self.pill.flash_success(_preview(final, 22))
+            self.pill_success(_preview(final, 22))
 
             # Learn from what was said, once the text is safely delivered.
             self.learner.observe(
                 raw, [w.text for w in result.low_confidence_words()])
-            self.root.after(0, self._refresh_status)
+            self.refresh_status()
 
         except Exception as e:
             self.last_failed = True
             self.log(f"Failed: {e}", "error")
-            self.pill.flash_error("Something went wrong")
+            self.pill_error("Something went wrong")
             if DEBUG:
                 traceback.print_exc()
 
@@ -645,7 +677,7 @@ class WhisprFlowApp:
 
         if not cleaned.speech_detected and not self._partial:
             self.log("No speech detected.", "warn")
-            self.pill.set_state(PillState.IDLE)
+            self.pill_state(PillState.IDLE)
             return None
 
         return await self.stt.transcribe(
@@ -654,7 +686,7 @@ class WhisprFlowApp:
         )
 
     async def _refine(self, raw: str, result) -> str:
-        if not (self.refinement_enabled.get() and self.refiner.is_configured):
+        if not (self._refine_on and self.refiner.is_configured):
             return basic_cleanup(raw)
 
         ctx = self._live_context
@@ -673,7 +705,7 @@ class WhisprFlowApp:
         if self.refiner.last_rejected:
             self.log(f"Refinement rejected ({self.refiner.last_rejected}) — kept raw text.",
                      "warn")
-        self.root.after(0, self._refresh_status)
+        self.refresh_status()
         return final
 
     def retry(self):
@@ -684,7 +716,7 @@ class WhisprFlowApp:
             self.generation += 1
             gen = self.generation
         samples, sr = self.last_audio
-        self.pill.set_state(PillState.PROCESSING)
+        self.pill_state(PillState.PROCESSING)
         self.log("Retrying\u2026")
         asyncio.run_coroutine_threadsafe(self._retry_from(samples, sr, gen), self.loop)
 
@@ -695,7 +727,7 @@ class WhisprFlowApp:
             return
         if not result.ok:
             self.log(f"Retry failed: {result.error}", "error")
-            self.pill.flash_error(_short_error(result.error))
+            self.pill_error(_short_error(result.error))
             return
         final = await self._refine(result.text, result)
         if self._stale(gen):
@@ -703,7 +735,7 @@ class WhisprFlowApp:
         self.last_text_injected = final
         await asyncio.to_thread(self.injector.inject, final)
         self.log(_preview(final), "ok")
-        self.pill.flash_success(_preview(final, 22))
+        self.pill_success(_preview(final, 22))
 
     # ══════════════════════════════════════════════════════════════════
     #  Hotkeys
@@ -792,6 +824,14 @@ class WhisprFlowApp:
             self.log("Ready. Hold Ctrl + Win to dictate.", "ok")
 
         self.root.mainloop()
+
+
+def _safe_call(fn, *args):
+    """Run a UI callback, swallowing errors from a torn-down window."""
+    try:
+        fn(*args)
+    except Exception:
+        pass
 
 
 def _preview(text: str, limit: int = 60) -> str:
