@@ -34,9 +34,11 @@ from PyInstaller.utils.hooks import (
 # --- numpy: package + compiled extensions + vendored DLLs -----------------
 numpy_datas, numpy_binaries, numpy_hidden = collect_all("numpy")
 
-# --- scipy: only signal is used, but let PyInstaller's hooks resolve its
-#     real dependency graph rather than guessing at it by name.
-scipy_datas, scipy_binaries, scipy_hidden = collect_all("scipy.signal")
+# --- scipy: only signal is used, but its extension modules are
+#     interdependent -- collecting just scipy.signal leaves out private
+#     helpers such as scipy._cyutility, and scipy then reports itself as
+#     "broken, extension modules cannot be imported". Collect the package.
+scipy_datas, scipy_binaries, scipy_hidden = collect_all("scipy")
 
 # sounddevice ships the PortAudio DLL as package data; without this the EXE
 # builds fine and then fails at runtime the first time the mic is opened.
