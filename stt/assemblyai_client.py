@@ -48,7 +48,7 @@ class AssemblyAIClient:
         language_code: str = "en",
         request_timeout: float = 30.0,
         poll_interval: float = 0.2,
-        max_wait: float = 60.0,
+        max_wait: float = 120.0,
     ):
         self.api_key = (api_key or os.getenv("ASSEMBLYAI_API_KEY", "")).strip()
         self.model = model
@@ -121,7 +121,7 @@ class AssemblyAIClient:
             client = await self._get_client()
             audio_url = await self._upload(client, float_to_wav_bytes(samples, sample_rate))
             transcript_id = await self._submit(client, audio_url, keyterms)
-            payload = await self._poll(client, transcript_id)
+            payload = await self._poll(client, transcript_id, duration)
             return self._parse(payload, started, duration)
 
         except httpx.TimeoutException:
@@ -169,9 +169,15 @@ class AssemblyAIClient:
         resp.raise_for_status()
         return resp.json()["id"]
 
-    async def _poll(self, client: httpx.AsyncClient, transcript_id: str) -> dict:
+    async def _poll(
+        self, client: httpx.AsyncClient, transcript_id: str, audio_seconds: float = 0.0
+    ) -> dict:
         endpoint = f"/v2/transcript/{transcript_id}"
-        deadline = time.monotonic() + self.max_wait
+        # Scale the deadline with audio length. AssemblyAI runs far faster
+        # than real time, but a fixed timeout would abandon a long
+        # dictation the server is still working on.
+        budget = max(self.max_wait, audio_seconds * 1.5 + 30.0)
+        deadline = time.monotonic() + budget
         delay = self.poll_interval
 
         while True:
@@ -185,7 +191,7 @@ class AssemblyAIClient:
             if status == "error":
                 raise RuntimeError(data.get("error", "transcription failed"))
             if time.monotonic() > deadline:
-                raise TimeoutError(f"Not ready after {self.max_wait:.0f}s")
+                raise TimeoutError(f"Not ready after {budget:.0f}s")
 
             await asyncio.sleep(delay)
             # Dictation clips finish fast: poll tightly, then ease off.

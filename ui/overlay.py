@@ -123,6 +123,7 @@ class FloatingPill:
         self._state_since = time.monotonic()
         self._status_text = ""
         self._partial_text = ""
+        self._locked = False
 
         # Animation state
         self._width = Spring(self.W_IDLE, 260, 26)
@@ -173,11 +174,21 @@ class FloatingPill:
         self._height.target = self.H_ACTIVE if active else self.H_IDLE
         self._reveal.target = 1.0 if active else 0.0
 
+        if state is not PillState.RECORDING:
+            self._locked = False
         if state is PillState.RECORDING:
             self._partial_text = ""
             for b in self._bars:
                 b.snap(0.0)
 
+        self._wake()
+
+    def set_locked(self, locked: bool) -> None:
+        """Hands-free mode. Shown as a persistent dot on the stop button so
+        the user can tell at a glance that it is still listening."""
+        if locked == self._locked:
+            return
+        self._locked = locked
         self._wake()
 
     def set_partial(self, text: str) -> None:
@@ -392,7 +403,7 @@ class FloatingPill:
         trimmed to fit, so a long transcript can never collide with them.
         """
         left = 32 * S           # clear of the cancel button
-        right = bw - 32 * S     # clear of the stop button
+        right = bw - (36 if self._locked else 32) * S   # clear of the stop button
         avail = right - left
         cy = bh // 2
 
@@ -469,8 +480,17 @@ class FloatingPill:
         cx, cy = bw - 19 * S, bh // 2
         r = 8 * S
         a = int(255 * reveal)
-        pulse = 1.0 + 0.06 * math.sin(time.monotonic() * 5)
-        rr = r * pulse
+
+        if self._locked:
+            # Steady, with a halo: hands-free and staying that way. No
+            # pulse, because a pulsing control reads as "about to stop".
+            d.ellipse([cx - r - 2.5 * S, cy - r - 2.5 * S,
+                       cx + r + 2.5 * S, cy + r + 2.5 * S],
+                      outline=(*ACCENT, int(150 * reveal)), width=max(1, int(1.3 * S)))
+            rr = r
+        else:
+            rr = r * (1.0 + 0.06 * math.sin(time.monotonic() * 5))
+
         d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=(*DANGER, a))
         s = 2.6 * S
         d.rounded_rectangle([cx - s, cy - s, cx + s, cy + s],

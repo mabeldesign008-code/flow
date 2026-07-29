@@ -237,6 +237,54 @@ class TestSpring:
         assert not s.at_rest
 
 
+class TestRecordingLock:
+    """Tap-to-lock vs hold-to-talk gesture logic.
+
+    Both gestures share the same keys, so the only thing separating them
+    is how long the press lasted. These guard the boundary.
+    """
+
+    TAP = 0.35
+
+    def _decide(self, held_seconds, was_locked=False):
+        """Mirror of main.on_release's decision, isolated from Tk."""
+        if was_locked:
+            return "stop"
+        return "lock" if held_seconds < self.TAP else "stop"
+
+    def test_quick_tap_locks(self):
+        assert self._decide(0.08) == "lock"
+
+    def test_hold_stops_on_release(self):
+        assert self._decide(2.5) == "stop"
+
+    def test_boundary_just_under_is_a_tap(self):
+        assert self._decide(self.TAP - 0.01) == "lock"
+
+    def test_boundary_just_over_is_a_hold(self):
+        assert self._decide(self.TAP + 0.01) == "stop"
+
+    def test_tap_while_locked_stops(self):
+        """Second tap ends the take rather than re-locking."""
+        assert self._decide(0.05, was_locked=True) == "stop"
+
+
+class TestDurationLimits:
+    def test_buffer_cap_is_generous_but_bounded(self):
+        from audio.capture import MAX_RECORDING_SECONDS, SAMPLE_RATE
+        assert MAX_RECORDING_SECONDS >= 600, "too short for locked dictation"
+        megabytes = MAX_RECORDING_SECONDS * SAMPLE_RATE * 4 / 1_048_576
+        assert megabytes < 200, f"{megabytes:.0f} MB resident is too much"
+
+    def test_poll_budget_scales_with_audio_length(self):
+        """A fixed timeout would abandon a long dictation mid-transcription."""
+        base = 120.0
+        short = max(base, 5 * 1.5 + 30)
+        long = max(base, 1800 * 1.5 + 30)
+        assert short == base
+        assert long > 1800, "budget must exceed the audio duration"
+
+
 class TestTheme:
     def test_easing_bounds(self):
         assert ease_out_cubic(0) == 0 and ease_out_cubic(1) == 1

@@ -87,6 +87,7 @@ def install_stubs():
 
     class Key:
         ctrl = "ctrl"; ctrl_l = "ctrl_l"; cmd = "cmd"; alt = "alt"
+        esc = "esc"; backspace = "backspace"; shift = "shift"
 
     class Controller:
         def press(self, k): pass
@@ -210,7 +211,52 @@ def main():
     else:
         print("  SKIP  no ASSEMBLYAI_API_KEY set")
 
-    print("\n=== 8. Thread safety ===")
+    print("\n=== 8. Recording lock (tap vs hold) ===")
+    from pynput import keyboard as _kb
+    CTRL, WIN = _kb.Key.ctrl_l, _kb.Key.cmd
+
+    def _press():
+        app.on_press(CTRL)
+        app.on_press(WIN)
+
+    def _release():
+        app.on_release(WIN)
+        app.on_release(CTRL)
+
+    def _pump(n=6):
+        for _ in range(n):
+            app.root.update()
+            _t.sleep(0.02)
+
+    # Hold past the tap threshold -> classic push-to-talk.
+    _press(); _pump()
+    check("hold starts recording", app.is_recording)
+    _t.sleep(app.TAP_SECONDS + 0.15)
+    _release(); _pump()
+    check("hold stops on release", not app.is_recording)
+    check("hold does not lock", not app.locked)
+
+    # Quick tap -> lock on.
+    _press(); _pump(2)
+    _release(); _pump()
+    check("tap keeps recording", app.is_recording)
+    check("tap sets lock", app.locked)
+
+    # Esc while locked cancels.
+    _gen = app.generation
+    app.on_press(_kb.Key.esc); _pump()
+    check("esc cancels a locked take", not app.is_recording and not app.locked)
+    check("esc invalidates the pipeline", app.generation > _gen)
+
+    # A stray Esc must not stick in pressed_keys and break the combo.
+    app.on_press(_kb.Key.esc)
+    _press(); _pump()
+    check("hotkey works after a stray esc", app.is_recording,
+          str(app.pressed_keys))
+    _release(); _pump()
+    check("keys released cleanly", not app.pressed_keys, str(app.pressed_keys))
+
+    print("\n=== 9. Thread safety ===")
     # Every UI call from the pipeline must be marshalled to the main
     # thread; calling Tk directly from the asyncio thread raises
     # "main thread is not in main loop" and kills the dictation.
@@ -259,7 +305,7 @@ def main():
     check("direct Tk access from a worker is the unsafe path",
           bool(direct) or True, "")  # informational
 
-    print("\n=== 9. Shutdown ===")
+    print("\n=== 10. Shutdown ===")
     try:
         app.capture.stop_stream()
         app.pill.destroy()

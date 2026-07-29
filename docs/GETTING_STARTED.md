@@ -50,12 +50,47 @@ you talk, then land at your cursor about half a second after you stop.
 
 | Action | How |
 |---|---|
-| Dictate | Hold `Ctrl + Win` |
+| **Dictate (short)** | **Hold** `Ctrl + Win`, speak, release |
+| **Dictate (long)** | **Tap** `Ctrl + Win`, speak hands-free, tap again to finish |
+| Cancel while locked | `Esc` |
 | Cancel mid-sentence | Click the **×** on the left of the pill |
 | Stop early | Click the **red square** on the right |
 | Undo | `Ctrl + Alt + Z` |
 | Retry after an error | Click the pill |
 | Settings | Double-click the tray icon |
+
+### Hands-free mode
+
+Holding the keys is fine for a sentence. For anything longer, **tap** the
+hotkey instead of holding it:
+
+- **Tap** `Ctrl + Win` (press and release quickly) → recording locks on.
+  The stop button gains a blue ring so you can see it is still listening.
+- Speak for as long as you like — hands completely free.
+- **Tap** `Ctrl + Win` again to finish, or press `Esc` to throw it away.
+
+Same keys, no new shortcut to remember. The app decides which you meant
+from how long you held them: under 0.35 s is a tap, longer is a hold.
+
+### How long can I speak?
+
+**Up to 30 minutes in one take.** That is roughly 4,500 spoken words.
+
+The limit is local memory, not the service — audio is buffered in RAM at
+about 3.8 MB per minute, so 30 minutes is ~115 MB. You will get a warning
+in the activity log 30 seconds before the cap, and the app stops and
+transcribes automatically rather than losing anything.
+
+For reference, everything else in the chain is far more generous:
+
+| Limit | Value |
+|---|---|
+| WhisprFlow buffer | 30 min |
+| AssemblyAI streaming session | 3 hours |
+| AssemblyAI upload | 10 hours / 2.2 GB |
+
+Cost is about **$0.10 per hour** of audio, so the free $50 credit covers
+roughly 185 hours.
 
 The app lives in your system tray. Closing the window hides it; quit from
 the tray menu.

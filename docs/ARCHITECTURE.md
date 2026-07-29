@@ -394,3 +394,41 @@ concurrent UI calls from four worker threads.
 This is the test that catches integration errors — undefined names, wrong
 call signatures between modules, thread violations — that unit tests
 structurally cannot.
+
+
+---
+
+## Recording lock
+
+Holding a chord for a two-minute monologue is uncomfortable, but adding a
+second shortcut means another thing to learn. Instead both gestures share
+the same keys and are separated by press duration:
+
+| Gesture | Held | Behaviour |
+|---|---|---|
+| Tap | < 0.35 s | Lock on; tap again to finish |
+| Hold | >= 0.35 s | Push-to-talk; stops on release |
+
+`Esc` cancels a locked take. It is handled *before* the key joins
+`pressed_keys` -- a stray Esc left in that set would break the
+exact-match combo check permanently, which the gesture tests caught.
+
+The locked pill drops the stop button's pulse and gains a steady blue
+halo. A pulsing control reads as "about to stop", which is the wrong
+signal for a state that is deliberately persistent.
+
+### Duration
+
+`MAX_RECORDING_SECONDS` is 30 minutes, raised from an arbitrary 5. The
+constraint is local memory, not the API: 16 kHz float32 mono is ~3.8 MB
+per minute, so 30 min is ~115 MB resident. AssemblyAI itself allows a
+3-hour streaming session and a 10-hour upload.
+
+A watchdog thread warns 30 s before the cap and then stops cleanly, so a
+forgotten lock transcribes what it has instead of silently truncating the
+start of the recording once the buffer wraps.
+
+The polling deadline also scales with audio length now
+(`audio_seconds * 1.5 + 30`). The previous fixed 60 s timeout would have
+abandoned any dictation longer than about a minute while the server was
+still working on it.

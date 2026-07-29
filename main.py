@@ -137,6 +137,12 @@ class WhisprFlowApp:
         self._start_time = 0.0
         self._partial = ""
 
+        # Hands-free mode. A quick tap of the hotkey locks recording on;
+        # holding it is classic push-to-talk. Both gestures use the same
+        # keys, so there is nothing extra to learn.
+        self.locked = False
+        self._press_time = 0.0
+
         self.loop = asyncio.new_event_loop()
 
         # Hotkeys
@@ -500,6 +506,9 @@ class WhisprFlowApp:
     def pill_partial(self, text: str):
         self._ui(self.pill.set_partial, text)
 
+    def pill_locked(self, locked: bool):
+        self._ui(self.pill.set_locked, locked)
+
     def refresh_status(self):
         self._ui(self._refresh_status)
 
@@ -551,6 +560,33 @@ class WhisprFlowApp:
         if self.streaming_enabled and self.stt.is_configured:
             asyncio.run_coroutine_threadsafe(self._open_stream(gen), self.loop)
 
+        threading.Thread(target=self._watch_duration, args=(gen,),
+                         daemon=True).start()
+
+    def _watch_duration(self, gen: int):
+        """Stop automatically at the buffer cap.
+
+        A locked recording the user forgets about would otherwise keep
+        going until the ring silently truncated the start of it.
+        """
+        limit = self.capture.max_seconds
+        warned = False
+        while True:
+            time.sleep(0.5)
+            with self._state_lock:
+                if gen != self.generation or not self.is_recording:
+                    return
+            elapsed = time.monotonic() - self._start_time
+            if not warned and elapsed > limit - 30:
+                warned = True
+                self.log(f"30 seconds left of the {limit / 60:.0f} minute limit.",
+                         "warn")
+            if elapsed >= limit:
+                self.log(f"Reached the {limit / 60:.0f} minute limit — "
+                         "transcribing what you have.", "warn")
+                self.stop_recording()
+                return
+
     def _grab_context(self):
         try:
             self._live_context = self.app_context.capture()
@@ -593,7 +629,9 @@ class WhisprFlowApp:
             if not self.is_recording:
                 return
             self.is_recording = False
+            self.locked = False
             gen = self.generation
+        self.pill_locked(False)
 
         beep_async(660, 60)
         audio = self.capture.end()
@@ -613,6 +651,7 @@ class WhisprFlowApp:
             if not self.is_recording:
                 return
             self.is_recording = False
+            self.locked = False
             self.generation += 1     # invalidates any in-flight pipeline
 
         self.capture.discard()
@@ -773,17 +812,50 @@ class WhisprFlowApp:
     #  Hotkeys
     # ══════════════════════════════════════════════════════════════════
 
+    # Below this, a press counts as a "tap" (lock on) rather than a hold.
+    TAP_SECONDS = 0.35
+
     def on_press(self, key):
+        # Esc cancels a locked recording -- with hands free, reaching for
+        # the pill with the mouse is the wrong reflex. Handled before the
+        # key joins pressed_keys, so a stray Esc can never pollute the set
+        # and permanently break the exact-match hotkey test below.
+        if key == keyboard.Key.esc:
+            if self.locked and self.is_recording:
+                self.cancel_recording()
+            return
+
         self.pressed_keys.add(key)
+
         # Exact match only. `issubset` meant Ctrl+Win+D (new desktop) and
         # Ctrl+Win+arrows all started phantom recordings.
-        if self.pressed_keys == self.hotkey_combo and not self.is_recording:
+        if self.pressed_keys != self.hotkey_combo:
+            return
+
+        if self.locked:
+            # Already hands-free: this press is the user finishing up.
+            self._press_time = 0.0
+            self.stop_recording()
+        elif not self.is_recording:
+            self._press_time = time.monotonic()
             self.start_recording()
 
     def on_release(self, key):
         was_hotkey = key in self.hotkey_combo
         self.pressed_keys.discard(key)
-        if was_hotkey and self.is_recording:
+        if not (was_hotkey and self.is_recording and self._press_time):
+            return
+
+        held = time.monotonic() - self._press_time
+        self._press_time = 0.0
+
+        if held < self.TAP_SECONDS:
+            # Quick tap -> stay recording until they tap again.
+            self.locked = True
+            self.log("Locked — tap Ctrl + Win again to finish, Esc to cancel.", "ok")
+            self.pill_locked(True)
+            beep_async(1180, 45)
+        else:
             self.stop_recording()
 
     def undo(self):

@@ -39,7 +39,7 @@ SAMPLE_RATE = 16000       # what every ASR model wants
 CHANNELS = 1
 BLOCKSIZE = 512           # ~32 ms; also Silero VAD's window size
 PREROLL_SECONDS = 0.5     # captured before the hotkey is even processed
-MAX_RECORDING_SECONDS = 300
+MAX_RECORDING_SECONDS = 1800   # 30 min; ~115 MB at 16 kHz float32
 
 
 @dataclass

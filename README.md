@@ -89,8 +89,13 @@ single biggest accuracy improvement available.
 
 | Key | Action |
 |---|---|
-| `Ctrl + Win` (hold) | Dictate |
+| `Ctrl + Win` (hold) | Dictate, stops when you let go |
+| `Ctrl + Win` (tap) | Lock recording on — tap again to finish |
+| `Esc` | Cancel a locked recording |
 | `Ctrl + Alt + Z` | Undo |
+
+Tap for hands-free dictation up to **30 minutes**; hold for a quick
+sentence.
 
 Click the left of the pill to cancel mid-recording, the right to stop
 early, or the pill itself after an error to retry.
