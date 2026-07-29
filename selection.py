@@ -16,6 +16,7 @@ That is invasive, so it is done carefully:
 
 from __future__ import annotations
 
+import itertools
 import logging
 import time
 from dataclasses import dataclass
@@ -33,6 +34,12 @@ logger = logging.getLogger(__name__)
 COPY_SETTLE = 0.14
 PASTE_SETTLE = 0.10
 RESTORE_DELAY = 0.45
+
+# Windows' clock granularity is ~15ms, so time_ns() alone can return the
+# same value for two rapid calls and the sentinel would not be unique.
+# A monotonic counter guarantees uniqueness regardless of clock
+# resolution. Caught by CI on the Windows runner.
+_probe_counter = itertools.count()
 
 
 @dataclass
@@ -65,7 +72,7 @@ class SelectionManager:
 
         # A sentinel lets us distinguish "nothing selected" (clipboard
         # unchanged) from "the user had already copied this exact text".
-        sentinel = f"__whisprflow_probe_{time.time_ns()}__"
+        sentinel = f"__whisprflow_probe_{time.time_ns()}_{next(_probe_counter)}__"
         try:
             pyperclip.copy(sentinel)
         except Exception as e:
