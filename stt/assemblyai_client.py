@@ -15,6 +15,7 @@ No official SDK: it is synchronous and would block the asyncio loop.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import time
 from typing import List, Optional
@@ -34,11 +35,7 @@ KEYTERM_MODELS = {"universal-3-5-pro", "universal-3-pro", "slam-1"}
 def _http2_available() -> bool:
     """httpx raises ImportError at construction if http2=True without `h2`.
     HTTP/1.1 works fine, so detect rather than crash."""
-    try:
-        import h2  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("h2") is not None
 
 
 class AssemblyAIClient:

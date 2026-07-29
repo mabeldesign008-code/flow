@@ -22,6 +22,7 @@ and `turn_is_formatted`.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
 import time
@@ -41,11 +42,7 @@ CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_MS // 1000
 
 
 def websockets_available() -> bool:
-    try:
-        import websockets  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("websockets") is not None
 
 
 class StreamingSession:
