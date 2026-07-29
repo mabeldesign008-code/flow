@@ -9,11 +9,13 @@ import asyncio
 import ctypes
 import logging
 import os
+import sys
 import threading
 import time
 import traceback
 import winsound
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import tkinter as tk
@@ -44,6 +46,17 @@ except Exception:
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
+
+def resource_path(*parts) -> Path:
+    """Locate a bundled data file.
+
+    PyInstaller unpacks datas into sys._MEIPASS at runtime; from source we
+    resolve relative to this file. Never relative to CWD -- launching from
+    a shortcut with a different working directory would break it.
+    """
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base.joinpath(*parts)
+
 
 CONFIG_DIR = default_config_dir()
 ENV_PATH = CONFIG_DIR / ".env"
@@ -137,6 +150,7 @@ class WhisprFlowApp:
         self.root.geometry("640x720")
         self.root.configure(bg=theme.HEX_BG_APP)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
+        self._set_window_icon()
 
         # Tk variables may only be touched on the main thread, so the
         # pipeline reads this plain mirror instead of the BooleanVar.
@@ -301,10 +315,28 @@ class WhisprFlowApp:
         b.bind("<Leave>", lambda e: b.config(bg=bg))
         return b
 
-    def _build_tray(self):
+    def _set_window_icon(self):
+        try:
+            ico = resource_path("assets", "icon.ico")
+            if ico.exists():
+                self.root.iconbitmap(default=str(ico))
+        except Exception:
+            pass  # cosmetic only
+
+    def _tray_image(self):
+        try:
+            png = resource_path("assets", "icon.png")
+            if png.exists():
+                return Image.open(png).convert("RGBA").resize((64, 64))
+        except Exception:
+            pass
         img = Image.new("RGB", (64, 64), theme.BG_APP)
         d = ImageDraw.Draw(img)
         d.rounded_rectangle([14, 26, 50, 38], radius=6, fill=theme.ACCENT)
+        return img
+
+    def _build_tray(self):
+        img = self._tray_image()
         menu = pystray.Menu(
             pystray.MenuItem("Open WhisprFlow", self.show_window, default=True),
             pystray.MenuItem("Dictionary", lambda: self.open_dictionary()),

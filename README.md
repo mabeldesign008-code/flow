@@ -3,25 +3,34 @@
 System-wide AI dictation for Windows. Hold a hotkey, speak, and polished
 text appears at your cursor in any application.
 
-> **Status:** actively being reworked. See [`AUDIT.md`](AUDIT.md) for the
-> full engineering audit and roadmap. Phase 1 (transcription engine) is done.
+> Rebuilt from the ground up — see [`AUDIT.md`](AUDIT.md) for the original
+> engineering audit and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for
+> how it works now.
 
 ---
 
-## Quick start
+## Download
+
+**[Download WhisprFlow.exe](https://github.com/mabeldesign008-code/flow/releases/latest)**
+— one file, no installer, no Python needed.
+
+Run it, paste an [AssemblyAI key](https://www.assemblyai.com/dashboard/signup)
+(free, no card, ~185 hours), then hold **Ctrl + Win** and speak.
+
+Full walkthrough: **[Getting started](docs/GETTING_STARTED.md)**
+
+> Windows SmartScreen will warn on first run because the binary is
+> unsigned. **More info → Run anyway**.
+
+### Run from source instead
 
 ```bash
 git clone https://github.com/mabeldesign008-code/flow.git
 cd flow
 pip install -r requirements.txt
-
-# Configure AssemblyAI (free $50 credit, no credit card)
 python setup_stt.py
-
 python main.py
 ```
-
-Hold **Ctrl + Win**, speak, release. Text is injected at the cursor.
 
 ---
 
@@ -129,8 +138,19 @@ eval/
 
 ## Requirements
 
-Windows 10/11, Python 3.9+, a microphone, and an internet connection for
-transcription.
+Windows 10/11, a microphone, and an internet connection. The prebuilt EXE
+needs nothing else; running from source needs Python 3.9+.
+
+## Building the EXE
+
+```bash
+pip install pyinstaller
+pyinstaller WhisprFlow.spec --noconfirm --clean
+```
+
+Releases are built automatically on a Windows runner by
+`.github/workflows/release.yml` — push a `v*` tag or run the workflow
+manually.
 
 ## Known limitations
 

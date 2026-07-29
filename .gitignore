@@ -72,3 +72,9 @@ eval/clips/*
 !eval/clips/.gitkeep
 eval/reference.jsonl
 eval/results*.json
+
+# PyInstaller output
+build/
+dist/
+package/
+*.spec.bak
