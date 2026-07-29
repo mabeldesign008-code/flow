@@ -54,6 +54,8 @@ drops a dictionary term — the raw transcript is used instead. See
 | Transcription | **AssemblyAI** — streaming partials, ~0.5 s tail |
 | Context | Foreground app via UI Automation (~5 ms) |
 | Profiles | Per-app formatting: code, terminal, chat, email, docs |
+| Command Mode | Select text, speak an instruction, rewritten in place |
+| Snippets | Voice-triggered text expansion, zero latency |
 | Dictionary | `%APPDATA%\WhisprFlow\user_dictionary.txt`, auto-learning |
 | Refinement | Groq `llama-3.1-8b-instant`, output verified by a guard |
 | Injection | Direct unicode ≤120 chars, else clipboard w/ restore |
@@ -90,6 +92,7 @@ single biggest accuracy improvement available.
 | Key | Action |
 |---|---|
 | `Ctrl + Win` (hold) | Dictate, stops when you let go |
+| `Ctrl + Shift + Win` | **Command Mode** — rewrite selected text by voice |
 | `Ctrl + Win` (tap) | Lock recording on — tap again to finish |
 | `Esc` | Cancel a locked recording |
 | `Ctrl + Alt + Z` | Undo |

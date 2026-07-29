@@ -225,6 +225,83 @@ class TestLearner:
         assert lr.candidates() == []
 
 
+# ── snippets ──────────────────────────────────────────────────────────────
+
+class TestSnippets:
+    def _set(self, tmp_path):
+        from context.snippets import SnippetSet
+        s = SnippetSet(tmp_path / "s.json")
+        s.add("my email address", "ama@example.com")
+        s.add("standard signoff", "Best regards,\nAma")
+        return s
+
+    def test_exact_utterance_replaced_entirely(self, tmp_path):
+        out, used = self._set(tmp_path).expand("my email address")
+        assert out == "ama@example.com" and used == ["my email address"]
+
+    def test_inline_substitution(self, tmp_path):
+        out, _ = self._set(tmp_path).expand("Send it to my email address, please.")
+        assert out == "Send it to ama@example.com, please."
+
+    def test_ignores_case_and_punctuation(self, tmp_path):
+        """Transcripts arrive punctuated and capitalised inconsistently."""
+        out, _ = self._set(tmp_path).expand("My email address.")
+        assert out == "ama@example.com"
+
+    def test_untouched_when_no_trigger(self, tmp_path):
+        text = "nothing to expand here"
+        out, used = self._set(tmp_path).expand(text)
+        assert out == text and used == []
+
+    def test_multiple_triggers(self, tmp_path):
+        out, used = self._set(tmp_path).expand(
+            "use my email address and standard signoff")
+        assert "ama@example.com" in out and "Best regards" in out
+        assert len(used) == 2
+
+    def test_longest_trigger_wins(self, tmp_path):
+        from context.snippets import SnippetSet
+        s = SnippetSet(tmp_path / "s.json")
+        s.add("my email", "short@x.com")
+        s.add("my work email address", "work@x.com")
+        out, _ = s.expand("my work email address")
+        assert out == "work@x.com"
+
+    def test_persists(self, tmp_path):
+        from context.snippets import SnippetSet
+        self._set(tmp_path)
+        assert SnippetSet(tmp_path / "s.json").get("my email address") == "ama@example.com"
+
+    def test_remove(self, tmp_path):
+        s = self._set(tmp_path)
+        assert s.remove("my email address")
+        assert s.expand("my email address")[0] == "my email address"
+
+    def test_rejects_overlong_trigger(self, tmp_path):
+        from context.snippets import SnippetSet
+        s = SnippetSet(tmp_path / "s.json")
+        assert not s.add("one two three four five six seven eight nine", "x")
+
+    def test_rejects_empty(self, tmp_path):
+        from context.snippets import SnippetSet
+        s = SnippetSet(tmp_path / "s.json")
+        assert not s.add("", "x") and not s.add("trigger", "")
+
+    def test_disabled_does_nothing(self, tmp_path):
+        from context.snippets import SnippetSet
+        s = SnippetSet(tmp_path / "s.json", enabled=False)
+        s.enabled = True
+        s.add("trigger", "expansion")
+        s.enabled = False
+        assert s.expand("trigger")[0] == "trigger"
+
+    def test_malformed_file_is_not_fatal(self, tmp_path):
+        from context.snippets import SnippetSet
+        f = tmp_path / "s.json"
+        f.write_text("{ not json")
+        assert len(SnippetSet(f)) == 0
+
+
 # ── refiner integration ───────────────────────────────────────────────────
 
 class TestRefinerProfiles:

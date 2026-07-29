@@ -35,7 +35,7 @@ from typing import Callable, Optional
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 from .theme import (
-    ACCENT, ACCENT_DIM, BG_PILL, DANGER, FONT_CANDIDATES, MUTED,
+    ACCENT, ACCENT_DIM, BG_PILL, COMMAND, DANGER, FONT_CANDIDATES, MUTED,
     SUCCESS, TEXT, ease_out_back, ease_out_cubic,
 )
 
@@ -124,6 +124,7 @@ class FloatingPill:
         self._status_text = ""
         self._partial_text = ""
         self._locked = False
+        self._command_mode = False
 
         # Animation state
         self._width = Spring(self.W_IDLE, 260, 26)
@@ -176,6 +177,8 @@ class FloatingPill:
 
         if state is not PillState.RECORDING:
             self._locked = False
+            self._command_mode = False
+        self._command_mode = False
         if state is PillState.RECORDING:
             self._partial_text = ""
             for b in self._bars:
@@ -189,6 +192,15 @@ class FloatingPill:
         if locked == self._locked:
             return
         self._locked = locked
+        self._wake()
+
+    def set_command_mode(self, active: bool) -> None:
+        """Command Mode recolours the pill so it is unmistakably not
+        dictation -- text is about to be *replaced*, not inserted, and
+        that deserves a different signal."""
+        if active == self._command_mode:
+            return
+        self._command_mode = active
         self._wake()
 
     def set_partial(self, text: str) -> None:
@@ -323,7 +335,8 @@ class FloatingPill:
             if a > 3:
                 d.rounded_rectangle(
                     [1, 1, w * S - 2, h * S - 2],
-                    radius=radius, outline=(*ACCENT, a), width=max(2, 2 * S),
+                    radius=radius, outline=(*self._accent(), a),
+                    width=max(2, 2 * S),
                 )
 
         # Pill body.
@@ -388,6 +401,10 @@ class FloatingPill:
             d.ellipse([x0 + i * gap - r, cy - r, x0 + i * gap + r, cy + r],
                       fill=(*MUTED, a))
 
+    def _accent(self):
+        """Violet while transforming a selection, blue while dictating."""
+        return COMMAND if self._command_mode else ACCENT
+
     def _draw_recording(self, d, bw, bh, S, reveal, dt):
         self._draw_cancel(d, bw, bh, S, reveal)
         if self._partial_text:
@@ -430,7 +447,8 @@ class FloatingPill:
         if (time.monotonic() % 1.0) < 0.6:
             cx = x + tw + 2.5 * S
             d.line([cx, cy - 5 * S, cx, cy + 5 * S],
-                   fill=(*ACCENT, int(220 * reveal)), width=max(1, int(1.2 * S)))
+                   fill=(*self._accent(), int(220 * reveal)),
+                   width=max(1, int(1.2 * S)))
 
     def _draw_waveform(self, d, bw, bh, S, reveal, dt):
         level = min(1.0, max(0.0, self._get_level() * 6.0))
@@ -460,7 +478,7 @@ class FloatingPill:
 
             # Hot centre, cooler edges.
             mix = level * (1.0 - dist * 0.5)
-            col = _lerp_rgb(TEXT, ACCENT, min(1.0, mix))
+            col = _lerp_rgb(TEXT, self._accent(), min(1.0, mix))
             d.rounded_rectangle(
                 [x - bar_w // 2, y0, x + bar_w // 2, y1],
                 radius=bar_w // 2, fill=(*col, int(255 * reveal)),
@@ -470,6 +488,20 @@ class FloatingPill:
         cx, cy = 19 * S, bh // 2
         r = 8 * S
         a = int(255 * reveal)
+
+        if self._command_mode:
+            # Sparkle glyph: this will transform text, not insert it.
+            d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(*COMMAND, a))
+            for dx, dy, size in ((0, 0, 3.4), (3.2, -3.2, 1.6)):
+                x, y = cx + dx * S, cy + dy * S
+                k = size * S
+                d.polygon([(x, y - k), (x + k * 0.32, y - k * 0.32),
+                           (x + k, y), (x + k * 0.32, y + k * 0.32),
+                           (x, y + k), (x - k * 0.32, y + k * 0.32),
+                           (x - k, y), (x - k * 0.32, y - k * 0.32)],
+                          fill=(255, 255, 255, a))
+            return
+
         d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(56, 56, 60, a))
         k = 3 * S
         for dx, dy in (((-k, -k), (k, k)), ((k, -k), (-k, k))):
@@ -486,7 +518,8 @@ class FloatingPill:
             # pulse, because a pulsing control reads as "about to stop".
             d.ellipse([cx - r - 2.5 * S, cy - r - 2.5 * S,
                        cx + r + 2.5 * S, cy + r + 2.5 * S],
-                      outline=(*ACCENT, int(150 * reveal)), width=max(1, int(1.3 * S)))
+                      outline=(*self._accent(), int(150 * reveal)),
+                      width=max(1, int(1.3 * S)))
             rr = r
         else:
             rr = r * (1.0 + 0.06 * math.sin(time.monotonic() * 5))

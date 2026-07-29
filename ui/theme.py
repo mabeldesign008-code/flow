@@ -18,6 +18,7 @@ FAINT = (92, 92, 102)
 
 ACCENT = (122, 162, 255)      # cool blue, used sparingly
 ACCENT_DIM = (92, 122, 200)
+COMMAND = (183, 148, 255)     # violet -- Command Mode, distinct from dictation
 SUCCESS = (74, 222, 128)
 WARNING = (250, 190, 88)
 DANGER = (248, 92, 92)
@@ -37,6 +38,7 @@ HEX_TEXT = hexc(TEXT)
 HEX_MUTED = hexc(MUTED)
 HEX_FAINT = hexc(FAINT)
 HEX_ACCENT = hexc(ACCENT)
+HEX_COMMAND = hexc(COMMAND)
 HEX_SUCCESS = hexc(SUCCESS)
 HEX_WARNING = hexc(WARNING)
 HEX_DANGER = hexc(DANGER)

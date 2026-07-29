@@ -28,9 +28,11 @@ from pynput import keyboard
 from pynput.keyboard import Controller as KeyboardController
 
 from audio import AudioCapture, process as process_audio
-from context import AppContextReader, DictionaryLearner, ProfileSet
+from context import AppContextReader, DictionaryLearner, ProfileSet, SnippetSet
 from injector import TextInjector
 from refine import Refiner, basic_cleanup
+from refine.commands import CommandProcessor
+from selection import SelectionManager
 from stt import (
     AssemblyAIClient, StreamingSession, UserDictionary,
     default_config_dir, websockets_available,
@@ -99,6 +101,8 @@ class WhisprFlowApp:
         self.dictionary = UserDictionary()
         self.injector = TextInjector()
         self.refiner = Refiner(api_key=os.getenv("GROQ_API_KEY", ""))
+        self.commands = CommandProcessor(api_key=os.getenv("GROQ_API_KEY", ""))
+        self.selection = SelectionManager()
         self.stt = AssemblyAIClient(
             api_key=os.getenv("ASSEMBLYAI_API_KEY", ""),
             model=os.getenv("ASSEMBLYAI_MODEL", "universal-3-5-pro"),
@@ -116,6 +120,8 @@ class WhisprFlowApp:
         )
         self.profiles = ProfileSet(CONFIG_DIR / "profiles.json")
         self.profiles.write_template()
+        self.snippets = SnippetSet(CONFIG_DIR / "snippets.json")
+        self.snippets.write_template()
         self.learner = DictionaryLearner(
             CONFIG_DIR / "learned.json", self.dictionary,
             enabled=_flag("WHISPRFLOW_AUTOLEARN", True),
@@ -142,6 +148,12 @@ class WhisprFlowApp:
         # keys, so there is nothing extra to learn.
         self.locked = False
         self._press_time = 0.0
+
+        # Command Mode: Ctrl+Shift+Win selects -> speak -> rewrite in place.
+        self.command_combo = {keyboard.Key.ctrl_l, keyboard.Key.shift,
+                              keyboard.Key.cmd}
+        self.command_mode = False
+        self._pending_selection = ""
 
         self.loop = asyncio.new_event_loop()
 
@@ -248,6 +260,32 @@ class WhisprFlowApp:
         # than an empty one.
         self.suggest_frame = tk.Frame(card3, bg=theme.HEX_BG_CARD)
         self.suggest_frame.pack(fill="x", pady=(10, 0))
+
+        # ── Command Mode ──
+        cmd = self._card(wrap, "Command Mode")
+        Label(cmd, text="Select text anywhere, then Ctrl + Shift + Win",
+              font=(theme.UI_FONT, 10), fg=theme.HEX_TEXT,
+              bg=theme.HEX_BG_CARD).pack(anchor="w")
+        Label(cmd,
+              text=("Speak an instruction — \u201cmake this formal\u201d, "
+                    "\u201cbullet points\u201d, \u201ctranslate to French\u201d."),
+              font=(theme.UI_FONT, 9), fg=theme.HEX_MUTED,
+              bg=theme.HEX_BG_CARD).pack(anchor="w", pady=(1, 6))
+        self.command_status = Label(cmd, text="", font=(theme.UI_FONT, 9),
+                                    fg=theme.HEX_MUTED, bg=theme.HEX_BG_CARD)
+        self.command_status.pack(anchor="w")
+
+        # ── Snippets ──
+        snip = self._card(wrap, "Snippets")
+        self.snippet_label = Label(
+            snip, text=f"{len(self.snippets)} triggers",
+            font=(theme.UI_FONT, 10), fg=theme.HEX_TEXT, bg=theme.HEX_BG_CARD)
+        self.snippet_label.pack(anchor="w")
+        Label(snip, text="Say a phrase, get canned text. No AI, no latency.",
+              font=(theme.UI_FONT, 9), fg=theme.HEX_MUTED,
+              bg=theme.HEX_BG_CARD).pack(anchor="w", pady=(1, 8))
+        self._button(snip, "Edit snippets", self.open_snippets,
+                     subtle=True).pack(anchor="w")
 
         # ── Context ──
         card5 = self._card(wrap, "Context")
@@ -380,6 +418,7 @@ class WhisprFlowApp:
             return
         self._persist("GROQ_API_KEY", key)
         self.refiner.set_api_key(key)
+        self.commands.set_api_key(key)
         self.log("Groq key saved.", "ok")
         self._refresh_status()
 
@@ -433,6 +472,17 @@ class WhisprFlowApp:
         self.learner.dismiss(term)
         self._refresh_status()
 
+    def open_snippets(self):
+        try:
+            self.snippets.save()
+            os.startfile(str(self.snippets.path))
+        except Exception as e:
+            self.log(f"Could not open snippets: {e}", "error")
+
+    def reload_snippets(self):
+        self.snippets.load()
+        self._refresh_status()
+
     def open_profiles(self):
         try:
             os.startfile(str(self.profiles.path))
@@ -472,6 +522,18 @@ class WhisprFlowApp:
                 txt, col = f"{st['model']} · guarded", theme.HEX_SUCCESS
         self.refine_status.config(text=txt, fg=col)
         self.dict_label.config(text=f"{len(self.dictionary)} terms")
+        self.snippet_label.config(text=f"{len(self.snippets)} triggers")
+
+        cs = self.commands.get_stats()
+        if not cs["configured"]:
+            self.command_status.config(text="Needs a Groq key", fg=theme.HEX_WARNING)
+        elif cs["invocations"]:
+            self.command_status.config(
+                text=f"{cs['invocations']} used \u00b7 {cs['rejections']} rejected",
+                fg=theme.HEX_MUTED)
+        else:
+            self.command_status.config(text=f"Ready ({cs['model']})",
+                                       fg=theme.HEX_SUCCESS)
         try:
             self._render_suggestions()
         except Exception:
@@ -508,6 +570,9 @@ class WhisprFlowApp:
 
     def pill_locked(self, locked: bool):
         self._ui(self.pill.set_locked, locked)
+
+    def pill_command(self, active: bool):
+        self._ui(self.pill.set_command_mode, active)
 
     def refresh_status(self):
         self._ui(self._refresh_status)
@@ -557,7 +622,7 @@ class WhisprFlowApp:
         # via UI Automation, versus 0.3-2 s for the OCR this replaced.
         threading.Thread(target=self._grab_context, daemon=True).start()
 
-        if self.streaming_enabled and self.stt.is_configured:
+        if self.streaming_enabled and self.stt.is_configured and not self.command_mode:
             asyncio.run_coroutine_threadsafe(self._open_stream(gen), self.loop)
 
         threading.Thread(target=self._watch_duration, args=(gen,),
@@ -624,14 +689,113 @@ class WhisprFlowApp:
         self._partial = text
         self.pill_partial(text)
 
+    def start_command_mode(self):
+        """Grab the selection, then record the instruction to apply to it."""
+        if not self.commands.is_configured:
+            self.log("Command Mode needs a Groq API key.", "error")
+            self.pill_error("Add a Groq key")
+            return
+
+        sel = self.selection.capture()
+        if not sel.ok or sel.is_empty:
+            self.log(f"Command Mode: {sel.error or 'nothing selected'}", "warn")
+            self.pill_error(sel.error or "Select text first")
+            return
+
+        with self._state_lock:
+            if self.is_recording:
+                return
+            self.is_recording = True
+            self.command_mode = True
+            self.generation += 1
+            gen = self.generation
+
+        self._pending_selection = sel.text
+        self._start_time = time.monotonic()
+        self._partial = ""
+        self.capture.begin()
+        beep_async(1320, 55)
+
+        preview = sel.text.strip().replace("\n", " ")
+        self.log(f"Command Mode — {len(sel.text)} chars selected: "
+                 f"{preview[:50]}{'…' if len(preview) > 50 else ''}")
+        self.pill_state(PillState.RECORDING, "command")
+        self.pill_command(True)
+
+        threading.Thread(target=self._grab_context, daemon=True).start()
+        threading.Thread(target=self._watch_duration, args=(gen,),
+                         daemon=True).start()
+
+    async def _run_command(self, audio, gen: int, selected: str):
+        """Transcribe the spoken instruction and apply it to the selection."""
+        try:
+            cleaned = await asyncio.to_thread(
+                process_audio, audio, self.capture.sample_rate)
+            if self._stale(gen):
+                return
+
+            result = await self.stt.transcribe(
+                cleaned.samples, cleaned.sample_rate,
+                keyterms=self.dictionary.as_keyterms())
+            if self._stale(gen):
+                return
+
+            if not result.ok:
+                self.log(f"Command failed: {result.error}", "error")
+                self.pill_error(_short_error(result.error))
+                return
+
+            instruction = result.text.strip()
+            if not instruction:
+                self.log("No instruction heard.", "warn")
+                self.pill_state(PillState.IDLE)
+                return
+
+            self.log(f"Command: \u201c{instruction}\u201d")
+
+            ctx = self._live_context
+            outcome = await self.commands.apply(
+                selected, instruction,
+                dictionary_terms=self.dictionary.as_keyterms(),
+                app_context=ctx.as_prompt() if ctx else "")
+
+            if self._stale(gen):
+                return
+
+            if not outcome.ok:
+                self.log(f"Command rejected: {outcome.error}", "error")
+                self.pill_error(_preview(outcome.error or "Failed", 22))
+                return
+
+            # The selection is still highlighted, so pasting replaces it.
+            ok = await asyncio.to_thread(self.selection.replace, outcome.text)
+            if not ok:
+                self.log("Could not replace the selection.", "error")
+                self.pill_error("Replace failed")
+                return
+
+            self.last_text_injected = outcome.text
+            self.log(f"\u2713 {_preview(outcome.text)}", "ok")
+            self.pill_success(_preview(outcome.text, 22))
+            self.refresh_status()
+
+        except Exception as e:
+            self.log(f"Command failed: {e}", "error")
+            self.pill_error("Something went wrong")
+            if DEBUG:
+                traceback.print_exc()
+
     def stop_recording(self):
         with self._state_lock:
             if not self.is_recording:
                 return
             self.is_recording = False
             self.locked = False
+            was_command = self.command_mode
+            self.command_mode = False
             gen = self.generation
         self.pill_locked(False)
+        self.pill_command(False)
 
         beep_async(660, 60)
         audio = self.capture.end()
@@ -643,6 +807,13 @@ class WhisprFlowApp:
             return
 
         self.pill_state(PillState.PROCESSING)
+
+        if was_command:
+            selected, self._pending_selection = self._pending_selection, ""
+            asyncio.run_coroutine_threadsafe(
+                self._run_command(audio, gen, selected), self.loop)
+            return
+
         session, self._session = self._session, None
         asyncio.run_coroutine_threadsafe(self._pipeline(audio, gen, session), self.loop)
 
@@ -652,6 +823,8 @@ class WhisprFlowApp:
                 return
             self.is_recording = False
             self.locked = False
+            self.command_mode = False
+            self._pending_selection = ""
             self.generation += 1     # invalidates any in-flight pipeline
 
         self.capture.discard()
@@ -692,6 +865,10 @@ class WhisprFlowApp:
                 return
 
             raw = result.text
+            expanded, used = self.snippets.expand(raw)
+            if used:
+                self.log(f"Snippet: {', '.join(used)}")
+                raw = expanded
             self.last_raw_text = raw
 
             if not raw.strip():
@@ -827,6 +1004,12 @@ class WhisprFlowApp:
 
         self.pressed_keys.add(key)
 
+        # Command Mode: capture the selection first, then record an
+        # instruction to apply to it.
+        if self.pressed_keys == self.command_combo and not self.is_recording:
+            self.start_command_mode()
+            return
+
         # Exact match only. `issubset` meant Ctrl+Win+D (new desktop) and
         # Ctrl+Win+arrows all started phantom recordings.
         if self.pressed_keys != self.hotkey_combo:
@@ -841,7 +1024,7 @@ class WhisprFlowApp:
             self.start_recording()
 
     def on_release(self, key):
-        was_hotkey = key in self.hotkey_combo
+        was_hotkey = key in self.hotkey_combo or key in self.command_combo
         self.pressed_keys.discard(key)
         if not (was_hotkey and self.is_recording and self._press_time):
             return
@@ -889,7 +1072,7 @@ class WhisprFlowApp:
         except Exception:
             pass
         self.capture.stop_stream()
-        for coro in (self.stt.close(), self.refiner.close()):
+        for coro in (self.stt.close(), self.refiner.close(), self.commands.close()):
             try:
                 asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout=3)
             except Exception:

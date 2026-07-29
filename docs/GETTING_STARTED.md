@@ -51,6 +51,7 @@ you talk, then land at your cursor about half a second after you stop.
 | Action | How |
 |---|---|
 | **Dictate (short)** | **Hold** `Ctrl + Win`, speak, release |
+| **Command Mode** | Select text, `Ctrl + Shift + Win`, speak an instruction |
 | **Dictate (long)** | **Tap** `Ctrl + Win`, speak hands-free, tap again to finish |
 | Cancel while locked | `Esc` |
 | Cancel mid-sentence | Click the **×** on the left of the pill |
@@ -71,6 +72,45 @@ hotkey instead of holding it:
 
 Same keys, no new shortcut to remember. The app decides which you meant
 from how long you held them: under 0.35 s is a tap, longer is a hold.
+
+### Command Mode — edit text by voice
+
+Select any text in any app, press **`Ctrl + Shift + Win`**, and speak what
+you want done to it. The selection is rewritten in place.
+
+| Say | Result |
+|---|---|
+| "make this more formal" | Casual note becomes professional prose |
+| "turn this into bullet points" | Paragraph becomes a list |
+| "translate to French" | Rewritten in French |
+| "fix the grammar" | Typos and grammar only, nothing else changed |
+| "add a docstring" | Docstring inserted into a selected function |
+| "make it shorter" | Trimmed, every point kept |
+
+The pill turns **violet** for Command Mode, so it is never confused with
+dictation — one inserts text, the other replaces it.
+
+This works in Gmail, VS Code, Slack, Word, Notion, browsers — anywhere you
+can select text. It is the feature Wispr Flow charges $12/month for.
+
+### Snippets — say a phrase, get canned text
+
+Open **Snippets → Edit snippets** and add trigger phrases:
+
+```json
+{
+  "snippets": [
+    { "trigger": "my email address", "text": "you@example.com" },
+    { "trigger": "standard signoff", "text": "Best regards,\nYour Name" }
+  ]
+}
+```
+
+Say the trigger while dictating and it expands. Triggers match regardless
+of case or punctuation, and work mid-sentence: *"send it to my email
+address please"* becomes *"send it to you@example.com please"*.
+
+No AI involved, so it costs nothing and adds no latency.
 
 ### How long can I speak?
 
